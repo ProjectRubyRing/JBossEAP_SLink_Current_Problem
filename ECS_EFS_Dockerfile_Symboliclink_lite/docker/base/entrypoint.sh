@@ -27,6 +27,9 @@
 #      「実際に書き込んでみて」検証する。
 #   5. サービスが intra-web かつフロントコンテナの場合のみ、
 #      EFS 上に /mnt/data/pdf がなければ作成する。
+#   6. JBoss を起動する (本番の entrypoint.sh と同じ分岐)。
+#      CMD が eap なら standalone.sh を本番と同じ引数で起動し (3-B の pin を付ける)、
+#      eap 以外なら CMD をそのまま exec する。
 #
 # 【なぜ fail-fast と事前検証にここまでこだわるのか】
 #   JBoss EAP の起動時ロギングは
@@ -55,6 +58,21 @@
 #   外す。current は「最後に起動したタスク」を示す目印としてのみ張り替える。
 #   詳細・実機検証結果は docs/LOG_ROTATION.md を参照。
 #
+# 【JAVA_OPTS の -Djboss.server.log.dir=${JBOSS_HOME}/standalone/log について】
+#   本番のエントリポイントは JAVA_OPTS にこの指定を入れている。値は JBoss の既定
+#   (jboss.server.base.dir/log) と同じで、イメージに焼いた standalone/log → mid/current
+#   のリンクを指す。JBoss 本体はこのパスを実体に解決せずに使う (ServerEnvironment) ため、
+#   この指定では日付変更時の rename / 再 open が current を辿り、上の事故は防げない。
+#   一方、standalone.sh は JAVA_OPTS → 起動引数の順に読んで最後の指定を採り、
+#   JBoss 本体も起動引数の -D でシステムプロパティを上書きする。そこで本スクリプトは
+#   「共有の置き場 (standalone/log や mid/ 配下) を指す明示指定」を運用者が選んだ
+#   出力先とは見なさず、起動引数の pin で上書きする (それ以外の場所は明示指定を尊重)。
+#   → 残したままでも pin は効く。ただし既定値と同じで役割が無く、ps で見える値が
+#     実際の出力先と食い違うため、本番の JAVA_OPTS からは削除を推奨する。
+#     削除して JAVA_OPTS が空になると standalone.conf の既定値 (ヒープサイズ等) が
+#     効き始めるので、削除前に起動ログの JAVA_OPTS 行を確認すること。
+#   詳細は docs/LOG_ROTATION.md の「10-1」を参照。
+#
 # 一意ディレクトリ名の方針 (LOG_ID_SOURCE で切り替え):
 #   random (既定) : ECS メタデータエンドポイントに依存せず、コンテナ起動時に自前で
 #                   「起動時刻(YYYYMMDDhhmmss) + '-' + ランダム英数字 8 桁」を生成する。
@@ -80,17 +98,28 @@
 #   COMPONENT_ROLE : front | back
 #   Service_Name   : サービス名 (interapi / intra-api / intra-web(intraweb) / sfapi)
 #   JBOSS_HOME     : JBoss EAP のインストール先 (既定 /opt/jboss-eap)
+#   SERVER_CONFIG  : CMD=eap のとき standalone.sh -c に渡す設定ファイル名
+#                    (base の ENV の既定は standalone.xml。CMD=eap で未設定なら FATAL)
+#
+# CMD=eap のときに JBoss へ渡す環境変数 (本番の entrypoint.sh と同じ。任意):
+#   EXTRASLB_TRUSTSTORE_PATH     : -Djavax.net.ssl.truststore の値
+#   EXTRASLB_TRUSTSTORE_PASSWORD : -Djavax.net.ssl.trustStorePassword の値 (起動ログでは伏せる)
+#   EXTRASLB_TRUSTSTORE_TYPE     : -Djavax.net.ssl.trustStoreType の値
+#   JBOSS_SERVER_OPTS            : standalone.sh への追加の引数。空白区切りで複数指定でき、
+#                                  値の中の引用符は解釈しない (本番と同じく単語分割して渡す)
 #
 # 任意の環境変数(タスク定義から上書き可能):
 #   CONFIG_SEED_MODE  : overwrite (既定) | missing | skip
 #                       overwrite = 毎起動 seed で上書きする (推奨)
 #                       missing   = 設定ファイルが無いときだけ復元する
 #                       skip      = 復元しない (configuration を永続化する運用)
-#   JBOSS_CONFIG_FILE : 起動に使う設定ファイル名 (既定 standalone.xml)
+#   JBOSS_CONFIG_FILE : 存在を確認する設定ファイル名
+#                       (既定は SERVER_CONFIG。それも未設定なら standalone.xml)
 #   LOG_ID_SOURCE     : random (既定) | taskid     … 上記「一意ディレクトリ名の方針」
 #   JBOSS_LOG_PIN     : on (既定) | off
 #                       on  = JBoss の書き込み先を mid/<LOG_ID> の実体パスへ固定する
-#                             (CMD が standalone.sh なら -Djboss.server.log.dir を自動付与)
+#                             (CMD が eap / standalone.sh なら -Djboss.server.log.dir を
+#                              自動付与。共有の置き場を指す明示指定はこれで上書きする)
 #                       off = 従来どおり current 経由で書く。複数タスクが並走すると
 #                             日付変更時のローテーションが他タスクのログを壊す。
 #                             切り分け・再現試験以外では使わないこと
@@ -175,6 +204,23 @@ case "${JBOSS_LOG_PIN:-on}" in
     on|off) ;;
     *) die "JBOSS_LOG_PIN の値が不正です: '${JBOSS_LOG_PIN}' (on|off)" ;;
 esac
+# 起動コマンドが空なら止める。タスク定義で entryPoint を上書きすると、Docker / ECS は
+# イメージの CMD (eap) を引き継がないため、command の指定漏れで起きる。
+# そのまま進むと current を張り替えた後に exec "$@" が何もせず、exit 0 で終わってしまう。
+[ "$#" -gt 0 ] \
+    || die "起動コマンド (CMD) がありません。タスク定義で entryPoint を上書きした場合は command に [\"eap\"] も指定してください。"
+# CMD=eap は 6 章で standalone.sh を -c "${SERVER_CONFIG}" 付きで起動する。
+# SERVER_CONFIG が空だと -c "" になり JBoss が起動できないため、ここで止める。
+if [ "${1:-}" = "eap" ]; then
+    [ -n "${SERVER_CONFIG:-}" ] \
+        || die "CMD=eap ですが SERVER_CONFIG (standalone.sh -c に渡す設定ファイル名。例: standalone.xml) が未設定です。"
+    [ -x "${JBOSS_HOME}/bin/standalone.sh" ] \
+        || die "CMD=eap ですが ${JBOSS_HOME}/bin/standalone.sh がありません。JBOSS_HOME と JBoss EAP の導入を確認してください。"
+    # 本番と同じく空でもそのまま渡すが、空の trustStoreType は JVM 既定のトラストストアを
+    # 読めなくする (WildFly 26 では HTTPS の SSL コンテキストが起動に失敗し、アプリも 404 になった)
+    [ -n "${EXTRASLB_TRUSTSTORE_TYPE:-}" ] \
+        || echo "[efs-entrypoint] WARN: EXTRASLB_TRUSTSTORE_TYPE が空です。-Djavax.net.ssl.trustStoreType= (空) になり JVM 既定のトラストストアを読めないため、JBoss の SSL コンテキスト (HTTPS など) が起動に失敗し得ます。" >&2
+fi
 
 # --- ランダム英数字 8 桁の生成 ----------------------------------------------
 # [0-9a-z] の 36 文字集合から 8 桁 (36^8 ≒ 2.8e12 通り) を生成する。
@@ -231,14 +277,81 @@ fetch_task_id() {
     return 1
 }
 
-# --- -Djboss.server.log.dir の明示指定の検出 --------------------------------
-# 起動引数か JAVA_OPTS で明示されていれば、運用者の意図を優先して pin しない。
-has_log_dir_opt() {
-    for _a in "$@"; do
-        case "${_a}" in -Djboss.server.log.dir=*) return 0 ;; esac
-    done
-    case " ${JAVA_OPTS:-} " in *" -Djboss.server.log.dir="*) return 0 ;; esac
+# --- -Djboss.server.log.dir の明示指定の扱い ---------------------------------
+# 起動引数 (CMD=eap のときは JBOSS_SERVER_OPTS) と JAVA_OPTS にある指定を 1 つずつ調べる。
+#   - 共有の置き場を指す値は pin で上書きする。イメージに焼いた ${JBOSS_HOME}/standalone/log
+#     (→ mid/current) と、実体が mid/ 配下になる値 (current 経由・他タスクのディレクトリ)。
+#     これを JBoss が使うと、日付変更時の rename / 再 open が他タスクのファイルに当たる。
+#     本番の JAVA_OPTS にある -Djboss.server.log.dir=${JBOSS_HOME}/standalone/log がこれ。
+#   - それ以外の値は、運用者が意図して別の場所へ出していると見なし、pin しない。
+# 値は standalone.sh と同じく引用符を外してから判定する。
+# MID_REAL (mid の実体パス。3-B で求める) を使うので、3-B より後で呼ぶこと。
+is_shared_log_dir() {
+    _v="$(printf '%s' "$1" | tr -d "'\"")"
+    case "${_v}" in
+        "${STANDALONE_DIR}/log"|"${STANDALONE_DIR}/log/"*) return 0 ;;
+    esac
+    _p="$(cd "${_v}" 2>/dev/null && pwd -P)" || return 1
+    case "${_p}/" in
+        "${MID_REAL}/"*) return 0 ;;
+    esac
     return 1
+}
+
+# 1 つの引数を判定し、上書きする指定は SHARED_LOG_DIRS に出どころ付きで足し、
+# 尊重する指定は FOREIGN_LOG_DIR に入れる。
+classify_log_dir_opt() {   # classify_log_dir_opt <引数> <出どころ>
+    case "$1" in
+        -Djboss.server.log.dir=*)
+            if is_shared_log_dir "${1#*=}"; then
+                SHARED_LOG_DIRS="${SHARED_LOG_DIRS:+${SHARED_LOG_DIRS}, }$2: ${1#*=}"
+            else
+                FOREIGN_LOG_DIR="${1#*=}"
+            fi
+            ;;
+    esac
+}
+
+# 尊重すべき明示指定があれば 0 を返す (その値は FOREIGN_LOG_DIR)。引数には CMD ("$@") を渡す。
+# CMD=eap のとき JBoss に渡る利用者指定の引数は JBOSS_SERVER_OPTS だけなので、
+# 6 章の exec と同じく空白で分けて調べる (パス名展開はしない)。
+find_foreign_log_dir() {
+    FOREIGN_LOG_DIR=""
+    SHARED_LOG_DIRS=""
+    if [ "${1:-}" = "eap" ]; then
+        set -f
+        # shellcheck disable=SC2086
+        set -- ${JBOSS_SERVER_OPTS:-}
+        set +f
+    fi
+    for _a in "$@"; do
+        classify_log_dir_opt "${_a}" "起動引数"
+    done
+    set -f
+    for _a in ${JAVA_OPTS:-}; do
+        classify_log_dir_opt "$(printf '%s' "${_a}" | tr -d "'\"")" "JAVA_OPTS"
+    done
+    set +f
+    [ -n "${FOREIGN_LOG_DIR}" ]
+}
+
+# --- 起動行をログへ出すときの伏せ字 -------------------------------------------
+# -D<名前>=<値> のうち、名前に pass / secret を含むもの (trustStorePassword など) の
+# 値を **** にする。CloudWatch Logs にパスワードを平文で残さないため
+# (exec する引数そのものは変えない)。値が空なら伏せない (未設定だと分かるように)。
+mask_args() {
+    _m=""
+    for _a in "$@"; do
+        case "${_a}" in
+            -D*=?*)
+                case "${_a%%=*}" in
+                    *[Pp][Aa][Ss][Ss]*|*[Ss][Ee][Cc][Rr][Ee][Tt]*) _a="${_a%%=*}=****" ;;
+                esac
+                ;;
+        esac
+        _m="${_m}${_m:+ }${_a}"
+    done
+    printf '%s' "${_m}"
 }
 
 # --- sed 用のエスケープ -------------------------------------------------------
@@ -300,7 +413,9 @@ pin_logging_properties() {
 CONF_DIR="${JBOSS_CONF_DIR:-${STANDALONE_DIR}/configuration}"
 SEED_DIR="${JBOSS_CONF_SEED_DIR:-${STANDALONE_DIR}/configuration-seed}"
 CONFIG_SEED_MODE="${CONFIG_SEED_MODE:-overwrite}"
-JBOSS_CONFIG_FILE="${JBOSS_CONFIG_FILE:-standalone.xml}"
+# 存在を確認する設定ファイル。CMD=eap は standalone.sh -c "${SERVER_CONFIG}" で起動する
+# (6 章) ので、既定では SERVER_CONFIG と同じファイルを確認する。
+JBOSS_CONFIG_FILE="${JBOSS_CONFIG_FILE:-${SERVER_CONFIG:-standalone.xml}}"
 
 # 上書きの邪魔になる既存エントリを、コピー前に通れる状態にしておく。
 #   - seed 側のディレクトリ構造を先に作る
@@ -433,7 +548,7 @@ if [ ! -f "${CONF_DIR}/logging.properties" ]; then
     die "${CONF_DIR}/logging.properties がありません。"
 fi
 [ -f "${CONF_DIR}/${JBOSS_CONFIG_FILE}" ] \
-    || die "${CONF_DIR}/${JBOSS_CONFIG_FILE} がありません。JBOSS_CONFIG_FILE の値と seed の内容を確認してください。"
+    || die "${CONF_DIR}/${JBOSS_CONFIG_FILE} がありません。SERVER_CONFIG (CMD=eap の -c) / JBOSS_CONFIG_FILE の値と seed の内容を確認してください。"
 
 # =============================================================================
 # 2. アプリログ用ディレクトリ (シンボリックリンクの実体)
@@ -509,29 +624,35 @@ say "JBoss EAP log dir: ${MID_DIR}/${LOG_ID} (LOG_ID_SOURCE=${LOG_ID_SOURCE})"
 # ディレクトリを掴む競合がある。
 LOG_OWN="$(cd "${MID_DIR}/${LOG_ID}" 2>/dev/null && pwd -P)" \
     || die "${MID_DIR}/${LOG_ID} を解決できません。"
+# 明示指定が共有の置き場を指すかの判定 (is_shared_log_dir) に使う
+MID_REAL="$(cd "${MID_DIR}" 2>/dev/null && pwd -P)" \
+    || die "${MID_DIR} を解決できません。"
 
+# PIN_OPT: 6 章で standalone.sh の直後に付ける引数 (空なら付けない)
+PIN_OPT=""
 JBOSS_LOG_PIN="${JBOSS_LOG_PIN:-on}"
 case "${JBOSS_LOG_PIN}" in
     on)
-        if has_log_dir_opt "$@"; then
-            echo "[efs-entrypoint] WARN: -Djboss.server.log.dir が明示指定されているため pin を適用しません (明示指定を優先します)。" >&2
-            echo "[efs-entrypoint] WARN: その値が current を経由するパスだと、日付変更時のローテーションで他タスクのログを壊します。" >&2
+        if find_foreign_log_dir "$@"; then
+            echo "[efs-entrypoint] WARN: -Djboss.server.log.dir=${FOREIGN_LOG_DIR} が明示指定されているため pin を適用しません (明示指定を優先します)。" >&2
+            echo "[efs-entrypoint] WARN: その場所を複数のタスクで共有していると、日付変更時のローテーションが他タスクのログを壊します。" >&2
         else
             # standalone.sh はこの変数から -Dorg.jboss.boot.log.file (logging サブシステム
             # 起動前のブートログ) と GC ログ (GC_LOG=true 時) の出力先を決める。
             export JBOSS_LOG_DIR="${LOG_OWN}"
             pin_logging_properties
             case "${1:-}" in
-                */standalone.sh|standalone.sh)
+                eap|*/standalone.sh|standalone.sh)
                     # JBoss 本体の jboss.server.log.dir (FILE ハンドラの relative-to、
-                    # Elytron の audit.log 等) を実体パスへ。standalone.sh は '--' 以降の
-                    # 引数を拾わないため、コマンド直後に挿入する。
-                    _cmd="$1"; shift
-                    set -- "${_cmd}" "-Djboss.server.log.dir=${LOG_OWN}" "$@"
+                    # Elytron の audit.log 等) を実体パスへ。付け方は 6 章。
+                    PIN_OPT="-Djboss.server.log.dir=${LOG_OWN}"
                     say "log pin: JBoss は ${LOG_OWN} へ直接書き込みます (current は書き込み経路に使いません)"
+                    if [ -n "${SHARED_LOG_DIRS}" ]; then
+                        say "note: 共有の置き場 (current 経由) を指す -Djboss.server.log.dir の指定 (${SHARED_LOG_DIRS}) は pin で上書きします (docs/LOG_ROTATION.md 10-1)"
+                    fi
                     ;;
                 *)
-                    echo "[efs-entrypoint] WARN: CMD が standalone.sh ではないため -Djboss.server.log.dir を自動付与できません。" >&2
+                    echo "[efs-entrypoint] WARN: CMD が eap / standalone.sh ではないため -Djboss.server.log.dir を自動付与できません。" >&2
                     echo "[efs-entrypoint] WARN: ラッパーから JBoss へ -Djboss.server.log.dir=\"\${JBOSS_LOG_DIR}\" を渡してください (JBOSS_LOG_DIR=${LOG_OWN})。" >&2
                     ;;
             esac
@@ -606,7 +727,57 @@ if [ "${COMPONENT_ROLE:-}" = "front" ]; then
     esac
 fi
 
-say "preflight OK. starting: $*"
+# =============================================================================
+# 6. JBoss の起動 (本番の entrypoint.sh と同じ分岐)
+# =============================================================================
+#   CMD が eap → standalone.sh を本番と同じ引数で起動する
+#   それ以外   → CMD をそのまま exec する
+# 本番の entrypoint.sh の最後の分岐:
+#   if [ "$1" = "eap" ]; then
+#       exec ${JBOSS_HOME}/bin/standalone.sh -b 0.0.0.0 -bmanagement 0.0.0.0 -c "${SERVER_CONFIG}" \
+#           -Djavax.net.ssl.truststore="${EXTRASLB_TRUSTSTORE_PATH}" \
+#           -Djavax.net.ssl.trustStorePassword="${EXTRASLB_TRUSTSTORE_PASSWORD}" \
+#           -Djavax.net.ssl.trustStoreType="${EXTRASLB_TRUSTSTORE_TYPE}" ${JBOSS_SERVER_OPTS}
+#   else
+#       exec "$@"
+#   fi
+# ここでは eap の起動行をいったん "$@" に組み立て、3-B の pin を反映してから 1 か所で
+# exec する (実際に渡す引数を、パスワードを伏せてログに出すため)。起動する内容は
+# 本番と同じで、違いは pin (-Djboss.server.log.dir=<実体パス>) が付くことだけ。
+if [ "${1:-}" = "eap" ]; then
+    if [ "$#" -gt 1 ]; then
+        shift
+        echo "[efs-entrypoint] WARN: CMD=eap の後ろの引数は使いません (本番と同じ): $(mask_args "$@")" >&2
+    fi
+    # JBOSS_SERVER_OPTS は空白区切りで複数の引数を渡せるよう、本番と同じく
+    # 引用符なしで展開する (単語分割させる)。
+    # ※ -Djavax.net.ssl.truststore は本番の綴りのまま。JVM (JSSE) が読むのは大文字 S の
+    #   javax.net.ssl.trustStore で、この綴りの指定は無視される (本番側で要確認)。
+    # shellcheck disable=SC2086
+    set -- "${JBOSS_HOME}/bin/standalone.sh" -b 0.0.0.0 -bmanagement 0.0.0.0 -c "${SERVER_CONFIG}" \
+        -Djavax.net.ssl.truststore="${EXTRASLB_TRUSTSTORE_PATH:-}" \
+        -Djavax.net.ssl.trustStorePassword="${EXTRASLB_TRUSTSTORE_PASSWORD:-}" \
+        -Djavax.net.ssl.trustStoreType="${EXTRASLB_TRUSTSTORE_TYPE:-}" \
+        ${JBOSS_SERVER_OPTS:-}
+fi
 
-# 本来の起動コマンド (CMD) へ制御を渡す
+# 3-B の pin を standalone.sh の引数へ反映する (PIN_OPT が空なら何もしない)。
+#   - 起動引数にある -Djboss.server.log.dir は取り除く。ここに残っているのは共有の置き場を
+#     指す指定だけ (それ以外があれば 3-B で pin をやめている) で、standalone.sh も JBoss も
+#     後に出てきた指定を採るため、残すと pin に勝ってしまう。
+#   - pin はコマンドの直後に置く (standalone.sh は '--' より後ろの引数を読まない)。
+#   JAVA_OPTS 側の指定は書き換えない。standalone.sh は JAVA_OPTS → 起動引数の順に読み、
+#   JBoss 本体も起動引数の -D でシステムプロパティを上書きするので、起動引数の pin が勝つ。
+if [ -n "${PIN_OPT}" ]; then
+    _cmd="$1"; shift
+    _n=$#
+    for _a in "$@"; do
+        case "${_a}" in -Djboss.server.log.dir=*) continue ;; esac
+        set -- "$@" "${_a}"
+    done
+    shift "${_n}"
+    set -- "${_cmd}" "${PIN_OPT}" "$@"
+fi
+
+say "preflight OK. starting: $(mask_args "$@")"
 exec "$@"

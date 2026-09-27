@@ -21,7 +21,9 @@
 #
 # タスク ID 方式に切り替える方法 (どれか 1 つ。イメージの再ビルドは不要):
 #   (a) タスク定義の environment に LOG_ID_SOURCE=taskid を設定する (推奨)
-#   (b) タスク定義の entryPoint を ["/usr/local/bin/efs-entrypoint-taskid.sh"] にする
+#   (b) タスク定義の entryPoint を ["/usr/local/bin/efs-entrypoint-taskid.sh"] にし、
+#       command に ["eap"] を指定する (entryPoint を上書きするとイメージの CMD は
+#       引き継がれないため。起動コマンドが空なら本体が FATAL で止まる)
 #
 # 挙動 (efs-entrypoint.sh の LOG_ID_SOURCE=taskid と同一):
 #   - ECS メタデータエンドポイント v4 (ECS_CONTAINER_METADATA_URI_V4) の TaskARN

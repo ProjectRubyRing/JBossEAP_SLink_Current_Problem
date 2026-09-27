@@ -177,7 +177,8 @@ private void rollOver() {
 ### 4-4. standalone.sh とログディレクトリ
 
 - 既定では JBOSS_LOG_DIR=$JBOSS_BASE_DIR/log（＝/opt/jboss-eap/standalone/log。リンクのまま）とし、-Dorg.jboss.boot.log.file=$JBOSS_LOG_DIR/server.log を JVM に渡す。
-- -Djboss.server.log.dir=\<dir\> を引数か JAVA_OPTS で渡すと、standalone.sh は JBOSS_LOG_DIR=$(readlink -m \<dir\>)（リンクを解決した実体パス）にする。JBoss 本体の jboss.server.log.dir（FILE ハンドラの relative-to）もこの値になる。
+- -Djboss.server.log.dir=\<dir\> を引数か JAVA_OPTS で渡すと、standalone.sh は JBOSS_LOG_DIR=$(readlink -m \<dir\>)（リンクを解決した実体パス）にする（ブートログと gc.log の出力先）。一方、JBoss 本体の jboss.server.log.dir（FILE ハンドラの relative-to）には、渡した \<dir\> が**リンクを解決しないまま**入る（ServerEnvironment は new File(値) をそのまま使う）。\<dir\> が current を経由するパスなら、実体パスへの固定にはならない。【2026-09-27 訂正。旧版は「JBoss 本体もこの値（解決後）になる」と書いていた。10-1 参照】
+- JAVA_OPTS と起動引数の両方にあるときは、standalone.sh は「JAVA_OPTS → 起動引数」の順に読んで最後の値を JBOSS_LOG_DIR にし、JBoss 本体（org.jboss.as.server.Main）も起動引数の -D でシステムプロパティを上書きする。つまり**起動引数の値が勝つ**（WildFly Core 15.0.1〔EAP 7.4 系〕・18.1.2〔WildFly 26〕・main の standalone.sh と Main.java で確認）。
 - JBOSS_LOG_DIR が環境変数で設定済みならそれを使う（未設定のときだけ既定値）。GC_LOG=true のときの gc.log も $JBOSS_LOG_DIR。
 - JVM が exit code 10（:shutdown(restart=true)）で終わると、standalone.sh は同じ変数のまま java を起動し直す（エントリポイントは再実行されない）。
 - LAUNCH_JBOSS_IN_BACKGROUND=true のときだけ standalone.sh は SIGTERM を JVM に中継する（未設定だと PID 1 の sh が SIGTERM を受け取っても JVM に届かず、stopTimeout 後に SIGKILL になる）。
@@ -738,7 +739,7 @@ aws elbv2 modify-target-group-attributes --target-group-arn <tg-arn> \
 
 | ファイル | 変更内容 |
 |---|---|
-| **docker/base/entrypoint.sh** | ①「3-B. JBoss のログ出力先を実体パスへ固定（pin）」を追加: 自分のディレクトリを current を経由せず解決し、JBOSS_LOG_DIR を export、CMD が standalone.sh なら -Djboss.server.log.dir=\<実体パス\> をコマンド直後に挿入、logging.properties に残った current 経由・前回 LOG_ID のパスを揃える。②LOG_ID_SOURCE（random／taskid）を追加し、旧タスク ID 方式を統合（メタデータ v4 から TaskARN を取得・3 回まで再試行・英数字とハイフン以外は拒否・取得できなければ random にフォールバック）。③事前検証を「自分の実体ディレクトリに書けるか」に変更し、standalone/log が別タスクを指していても異常扱いしない（並行起動では正常）。 |
+| **docker/base/entrypoint.sh** | ①「3-B. JBoss のログ出力先を実体パスへ固定（pin）」を追加: 自分のディレクトリを current を経由せず解決し、JBOSS_LOG_DIR を export、CMD が eap（本番の起動方式）か standalone.sh なら -Djboss.server.log.dir=\<実体パス\> を standalone.sh のコマンド直後に付ける、logging.properties に残った current 経由・前回 LOG_ID のパスを揃える。共有の置き場（standalone/log・mid/ 配下）を指す明示指定は pin で上書きする。②LOG_ID_SOURCE（random／taskid）を追加し、旧タスク ID 方式を統合（メタデータ v4 から TaskARN を取得・3 回まで再試行・英数字とハイフン以外は拒否・取得できなければ random にフォールバック）。③事前検証を「自分の実体ディレクトリに書けるか」に変更し、standalone/log が別タスクを指していても異常扱いしない（並行起動では正常）。④【2026-09-27 追記】最後に本番と同じ分岐（CMD が eap なら standalone.sh -b 0.0.0.0 -bmanagement 0.0.0.0 -c "${SERVER_CONFIG}" … ${JBOSS_SERVER_OPTS}、それ以外は exec "$@"）を置いた（10-1）。 |
 | **docker/base/entrypoint.taskid.sh** | 別実装をやめ、LOG_ID_SOURCE=taskid を既定にして efs-entrypoint.sh を呼ぶ互換ラッパーにした（設定復元・fail-fast・pin の移植漏れを構造的に無くす）。自分自身を呼ぶ誤設定は FATAL で停止 |
 | **docker/base/Dockerfile** | efs-entrypoint.sh と efs-entrypoint-taskid.sh の両方をイメージに入れる（CRLF 除去も両方） |
 | **docker/front/Dockerfile、docker/back/Dockerfile** | コメントを実態に合わせた（リンクは入口として残し、JBoss は実体パスへ書く）。リンクの作り方は変更なし |
@@ -752,13 +753,16 @@ aws elbv2 modify-target-group-attributes --target-group-arn <tg-arn> \
 |---|---|---|
 | **LOG_ID_SOURCE** | random | random: 起動時刻-ランダム8桁（ECS メタデータに依存しない）／taskid: ECS タスク ID（describe-tasks・CloudWatch と突合せしやすい。取得失敗時は random） |
 | **JBOSS_LOG_PIN** | on | on: JBoss の書き込み先を mid/\<LOG_ID\> の実体パスへ固定／off: 従来どおり current 経由（切り分け・再現試験用。本番では使わない） |
-| **JBOSS_LOG_DIR（エントリポイントが export）** | ― | standalone.sh が -Dorg.jboss.boot.log.file と gc.log の出力先に使う。CMD が standalone.sh 以外のラッパーの場合は、ラッパーから -Djboss.server.log.dir="$JBOSS_LOG_DIR" を渡す |
-| **CONFIG_SEED_MODE／JBOSS_CONFIG_FILE** | overwrite／standalone.xml | 従来どおり |
+| **JBOSS_LOG_DIR（エントリポイントが export）** | ― | standalone.sh が -Dorg.jboss.boot.log.file と gc.log の出力先に使う。CMD が eap／standalone.sh 以外のラッパーの場合は、ラッパーから -Djboss.server.log.dir="$JBOSS_LOG_DIR" を渡す |
+| **CONFIG_SEED_MODE** | overwrite | 従来どおり |
+| **SERVER_CONFIG**（2026-09-27 追記） | standalone.xml（base の ENV） | CMD=eap のとき standalone.sh -c に渡す設定ファイル名（本番の値に合わせる）。未設定なら current を触る前に FATAL |
+| **EXTRASLB_TRUSTSTORE_PATH／_PASSWORD／_TYPE、JBOSS_SERVER_OPTS**（2026-09-27 追記） | TYPE だけ JKS（base の ENV）、他は空 | CMD=eap のとき本番と同じく -Djavax.net.ssl.truststore／trustStorePassword／trustStoreType と追加の引数（空白区切り）として渡す。パスワードは起動ログで **** に伏せる。TYPE が空だと WARN（10-1） |
+| **JBOSS_CONFIG_FILE** | SERVER_CONFIG（それも無ければ standalone.xml） | 存在を確認する設定ファイル名 |
 
 ### タスク ID 方式（旧実装）への切り替え（再ビルド不要）
 
 - 推奨: タスク定義の environment に LOG_ID_SOURCE=taskid を設定する。
-- または: タスク定義の entryPoint を ["/usr/local/bin/efs-entrypoint-taskid.sh"] にする。
+- または: タスク定義の entryPoint を ["/usr/local/bin/efs-entrypoint-taskid.sh"] にする。【2026-09-27 追記】このときは command に ["eap"] も指定する（entryPoint を上書きすると Docker／ECS はイメージの CMD を引き継がない。起動コマンドが空だとエントリポイントは current を触る前に FATAL で止まる）。
 - どちらでも configuration の復元・fail-fast・実体パスへの固定が必ず効く（旧ファイルで必要だった「復元ブロックの移植」は不要になった）。
 
 ### 修正後のエントリポイントの流れ
@@ -774,8 +778,14 @@ aws elbv2 modify-target-group-attributes --target-group-arn <tg-arn> \
 3-B. pin: LOG_OWN=$(cd mid/<LOG_ID> && pwd -P)            … current を経由しない実体パス
    export JBOSS_LOG_DIR=$LOG_OWN
    logging.properties の fileName を $LOG_OWN に揃える
-   exec standalone.sh -Djboss.server.log.dir=$LOG_OWN ... … rename も再 open も自分のディレクトリ
-4. 書き込み検証 ($LOG_OWN, tmp, data) → 5. pdf → exec
+   PIN_OPT=-Djboss.server.log.dir=$LOG_OWN                 … 共有の置き場を指す明示指定は上書き
+4. 書き込み検証 ($LOG_OWN, tmp, data) → 5. pdf
+6. 起動 (本番と同じ分岐。2026-09-27 追記)
+   CMD=eap  → exec standalone.sh $PIN_OPT -b 0.0.0.0 -bmanagement 0.0.0.0 -c "$SERVER_CONFIG"
+                   -Djavax.net.ssl.truststore=… -Djavax.net.ssl.trustStorePassword=…
+                   -Djavax.net.ssl.trustStoreType=… $JBOSS_SERVER_OPTS
+                                                          … rename も再 open も自分のディレクトリ
+   それ以外 → exec "$@" (CMD が standalone.sh ならコマンド直後に $PIN_OPT)
 ```
 
 ### 起動ログ（CloudWatch）の例
@@ -789,6 +799,112 @@ aws elbv2 modify-target-group-attributes --target-group-arn <tg-arn> \
 [efs-entrypoint] log -> /mnt/logs/intra-web-front/logs/intra-web/mid/20260926231418-ebbisg5u (書き込み可)
 [efs-entrypoint] preflight OK. starting: /opt/jboss-eap/bin/standalone.sh -Djboss.server.log.dir=/mnt/logs/intra-web-front/logs/intra-web/mid/20260926231418-ebbisg5u -b 0.0.0.0
 ```
+
+### 10-1. 本番の起動方式（CMD=eap）と、JAVA_OPTS の -Djboss.server.log.dir の扱い（2026-09-27 追記）
+
+> **やさしく言うと:** 本番は「eap」という合言葉で JBoss を起動していました。しかも起動の前に「ログは /opt/jboss-eap/standalone/log に書いてね」というメモ（JAVA_OPTS）を渡していました。このメモの住所は、みんなで共有している案内板（current）を通る道順です。最初の修正は「メモがあるなら本人の希望だから」と遠慮して、正しい住所（pin）を渡すのをやめてしまうところでした。今回は「共有の案内板を通る道順のメモ」は本人の希望とは見なさず、正しい住所で上書きするようにしました。メモ自体は消すのがおすすめです。
+
+**(1) 本番の起動方式に合わせた変更**
+
+本番の entrypoint.sh は、最後に次の分岐で JBoss を起動する。
+
+```sh
+if [ "$1" = "eap" ]; then
+    exec ${JBOSS_HOME}/bin/standalone.sh -b 0.0.0.0 -bmanagement 0.0.0.0 -c "${SERVER_CONFIG}" \
+        -Djavax.net.ssl.truststore="${EXTRASLB_TRUSTSTORE_PATH}" \
+        -Djavax.net.ssl.trustStorePassword="${EXTRASLB_TRUSTSTORE_PASSWORD}" \
+        -Djavax.net.ssl.trustStoreType="${EXTRASLB_TRUSTSTORE_TYPE}" ${JBOSS_SERVER_OPTS}
+else
+    exec "$@"
+fi
+```
+
+最初の版の実装は「CMD に standalone.sh を直接書く」前提で、pin も CMD が standalone.sh のときだけ付けていた。本番の CMD=eap では pin が付かない（WARN が出るだけ）ので、次のように直した。
+
+| 項目 | 本番 | 本リポジトリ（修正後） |
+|---|---|---|
+| 分岐 | 最後に eap／それ以外 | 同じ（entrypoint.sh の 6 章）。eap の起動行を組み立ててから 1 か所で exec する |
+| eap の起動行 | 上のとおり | 同じ引数・同じ順序。違いは**コマンド直後に -Djboss.server.log.dir=\<実体パス\>（pin）が付く**ことだけ |
+| ${JBOSS_HOME} | 引用符なし | 引用符あり（値が同じなら結果も同じ） |
+| ${JBOSS_SERVER_OPTS} | 引用符なし（空白で分割） | 同じ（値の中の引用符は解釈されない） |
+| 未設定の変数 | 空の値のまま渡る | 同じ（set -u でも止まらないよう ${VAR:-} で空にする） |
+| SERVER_CONFIG が未設定 | -c "" になり JBoss が起動に失敗 | current を触る前に FATAL で止める |
+| 起動コマンドが空（entryPoint だけ上書きして command を付け忘れた） | exec "$@" が何もせず exit 0 で終わる | current を触る前に FATAL で止める |
+| eap の後ろの引数 | 使わない | 使わない（WARN を出す） |
+| 起動行のログ | 無し | preflight OK の行に実際の起動行を出す（パスワード類の値は ****） |
+| front／back の CMD | （本番のイメージの定義による） | ["eap"] |
+
+**(2) JAVA_OPTS の -Djboss.server.log.dir=${JBOSS_HOME}/standalone/log は何をしているか**
+
+本番のエントリポイントは、pin の処理より前に JAVA_OPTS へこの指定を入れている。
+
+| 読む側 | 何に使うか | この指定があるとどうなるか | 実機（WildFly 26.1.3、pin なし） |
+|---|---|---|---|
+| standalone.sh | JBOSS_LOG_DIR（ブートログ・gc.log の出力先） | readlink -m で解決した「その瞬間の current の先」になる | -Dorg.jboss.boot.log.file=mid/\<B の ID\>/server.log |
+| JBoss 本体（ServerEnvironment） | jboss.server.log.dir（FILE ハンドラの relative-to、audit.log など） | リンクを解決しない /opt/jboss-eap/standalone/log のまま入る。**JBoss の既定値（jboss.server.base.dir/log）と同じ** | CLI の :resolve-expression が …/opt/jboss-eap/standalone/log を返した |
+| standalone.conf | JAVA_OPTS が空のときだけ、既定の JAVA_OPTS（ヒープサイズなど）を入れる | JAVA_OPTS が空でなくなるので既定値は入らない | 「JAVA_OPTS already set in environment; overriding default settings with values: …」が出る |
+
+→ **この指定は日付変更時の事故を防がない。** 日付変更時の rename と再 open は、JBoss 本体が /opt/jboss-eap/standalone/log（＝current 経由）のパス文字列で行う。本番と同じ構成（eap ＋ この指定、pin なし）で実機を動かすと、ご報告の症状がそのまま再現した（(5)）。
+
+**(3) 最初の版の実装との関係（重要）**
+
+最初の版は「-Djboss.server.log.dir が引数か JAVA_OPTS で明示されていれば、運用者の意図を優先して pin しない」だった。本番はこの指定を JAVA_OPTS に入れているので、**最初の版をそのまま本番へ入れると pin が一切効かず、修正が無効になる**（WARN が 2 行出るだけ）。そこで判定を次のように変えた。
+
+| -Djboss.server.log.dir の値 | 例 | 扱い |
+|---|---|---|
+| イメージに焼いた入口リンク（その配下を含む。引用符・末尾の / は無視） | ${JBOSS_HOME}/standalone/log | **pin で上書き**（note 行に出どころと値を出す） |
+| 実体が mid/ の配下になるパス | …/mid/current、…/mid/\<他タスクの ID\> | **pin で上書き** |
+| それ以外 | /var/log/jboss、存在しないパス | 運用者の指定として尊重する（pin しない。WARN を出す） |
+
+上書きのしかた:
+
+- JAVA_OPTS の値は書き換えない。standalone.sh は「JAVA_OPTS → 起動引数」の順に読んで最後の値を JBOSS_LOG_DIR にし、JBoss 本体（org.jboss.as.server.Main）も起動引数の -D でシステムプロパティを上書きする。したがって**起動引数の pin が勝つ**（WildFly Core 15.0.1〔EAP 7.4 系〕・18.1.2〔WildFly 26〕・main のソースで確認し、実機でも確認した。(5)）。
+- 起動引数（CMD や JBOSS_SERVER_OPTS）にある共有の指定は取り除く。起動引数の中では後ろの指定が勝つため、残すと pin より優先されてしまう。
+
+**(4) この指定は削除すべきか、残したまま動かすべきか**
+
+| 案 | 内容 | 良い点 | 注意点 | 評価 |
+|---|---|---|---|---|
+| 1. 本番の JAVA_OPTS から削除する | ログの出力先は pin だけで決める | JVM 引数の -Djboss.server.log.dir が 1 つになり、ps や ECS Exec で見える値が実際の出力先と一致する。削除する値は既定値と同じなので、pin を切った（JBOSS_LOG_PIN=off）ときの動きも変わらない | 削除して JAVA_OPTS が空になると、standalone.conf の既定の JAVA_OPTS（ヒープサイズ・Metaspace など）が効き始める。削除の前に確認が必要（下記） | **◎ 推奨** |
+| 2. 残したままにする | エントリポイントが pin で上書きする（今回の実装がこの状態でも動く） | 本番の JAVA_OPTS に触らずに修正を入れられる（段階的に移行できる） | JVM 引数に値が 2 つ並ぶ（前はリンクのパス、後ろが実体パス）ので紛らわしい。調査のときに「リンクのパスに書いている」と読み違えやすい | ○ 移行期間は可 |
+| 3. エントリポイントが JAVA_OPTS の値を書き換える | JAVA_OPTS の中の値を実体パスへ置き換える | JVM 引数の値が 1 つにそろう | JAVA_OPTS は引用符なども入る自由な文字列で、機械的な置き換えは他の指定を壊す恐れがある。起動引数で確実に上書きできるので必要ない | × 採用しない |
+
+**結論:** 実装は「残したままでも動く」ようにした（案 2 の状態でも事故は起きないことを (5) で確認）。そのうえで、**本番の JAVA_OPTS からは削除することを推奨する（案 1）**。
+
+削除の手順:
+
+1. 修正したエントリポイントのイメージをデプロイする（この時点では JAVA_OPTS はそのまま）。CloudWatch に log pin 行と note 行が出ること、ECS Exec で見た fd が mid/\<自分の LOG_ID\>/server.log であることを確かめる（11 章）。
+2. 次のリリースで JAVA_OPTS から -Djboss.server.log.dir を削除する。その前に、今の起動ログにある standalone.conf の行を確認する。
+   - 「JAVA_OPTS already set in environment; overriding default settings with values: …」の値が -Djboss.server.log.dir だけ → 削除すると JAVA_OPTS が空になり、standalone.conf の既定値が入るようになる（ヒープサイズなどが変わる）。今の動きを保つなら、必要な値（-Xmx など）を JAVA_OPTS に明示してから消す。
+   - 他の指定もある → 削除しても standalone.conf の扱いは変わらない。
+   - 参考: WildFly Core 15.0.1 の standalone.conf の既定は -Xms64m -Xmx512m -XX:MetaspaceSize=96M -XX:MaxMetaspaceSize=256m -Djava.net.preferIPv4Stack=true -Djboss.modules.system.pkgs=… -Djava.awt.headless=true。JBoss EAP の値は、製品の bin/standalone.conf で確認する。
+3. 削除した後は note 行が出なくなり、JVM 引数の -Djboss.server.log.dir は実体パスの 1 つだけになる。
+
+**(5) 実機確認（WildFly 26.1.3 ≒ EAP 7.4、Temurin JRE 11.0.32.1、2026-09-27）**
+
+test/local/rotation_local.sh の S1（A が 0 時をまたいで稼働 → 0 時後に B が起動 → A を SIGTERM で停止）を、本番と同じ起動方式（T_CMD=eap）で実行した。「jboss.server.log.dir」の列は、JBoss 本体に CLI（:resolve-expression）で問い合わせた実際の値。
+
+| 構成 | jboss.server.log.dir | JVM 引数 | A 停止後の B の fd | mid/ の最終状態 | 判定 |
+|---|---|---|---|---|---|
+| eap ＋ JAVA_OPTS に指定あり ＋ pin あり（今回の実装・案 2） | A・B とも mid/\<自分の ID\> | -Djboss.server.log.dir が 2 つ（前: JAVA_OPTS 由来のリンクのパス、後: pin）。-Dorg.jboss.boot.log.file=mid/\<B\>/server.log | server.log のまま | A: server.log.2026-09-26（9/26 の起動・TICK）と server.log（停止ログ）。B: server.log（9/27 の起動・TICK すべて） | **解消** |
+| eap ＋ 指定なし ＋ pin あり（案 1＝推奨） | A・B とも mid/\<自分の ID\> | -Djboss.server.log.dir は pin の 1 つだけ。-Dorg.jboss.boot.log.file=mid/\<B\>/server.log | server.log のまま | A: server.log.2026-09-26（9/26 の起動・TICK）と server.log（停止ログ）。B: server.log（9/27 の起動・TICK すべて） | **解消** |
+| eap ＋ JAVA_OPTS に指定あり ＋ pin なし（本番の現状） | A・B とも …/opt/jboss-eap/standalone/log（リンクのまま） | -Djboss.server.log.dir=…/standalone/log の 1 つ。-Dorg.jboss.boot.log.file=mid/\<B\>/server.log | **server.log.2026-09-26** | A: server.log（9/26 分のまま改名されない）。B: server.log（**A の停止ログ**）と server.log.2026-09-26（**B の 9/27 分すべて**） | **再現** |
+
+**(6) 起動行の javax.net.ssl.* について（本修正の対象外・本番で要確認）**
+
+起動行は本番のものをそのまま使っているが、実機で次のことが分かった（WildFly 26.1.3 ＋ JRE 11。JDK の cacerts は JKS 形式・CA 118 件）。
+
+| ケース | 起動 | javax.net.ssl.trustStore（JVM が読む名前） | JVM 既定の TrustManager |
+|---|---|---|---|
+| 本番と同じ綴り（小文字の truststore）、パスワード changeit、型 JKS | 正常 | null（小文字の truststore は別の名前のプロパティとして入るだけ） | CA 118 件＝**JDK の cacerts のまま（独自のトラストストアは使われない）** |
+| 同上で、パスワードが changeit 以外 | **エラー付き（WFLYSRV0026）・アプリが 404** | null | 失敗: Keystore was tampered with, or password was incorrect（本番のパスワードが cacerts に使われるため） |
+| 大文字の trustStore も渡した場合 | 正常 | 独自のトラストストア | CA 1 件＝独自のトラストストア |
+| EXTRASLB_* が未設定（空の値） | **エラー付き・アプリが 404** | null | 失敗: KeyStore " not found"（型が空のため） |
+
+- Java のシステムプロパティは大文字と小文字を区別する。JSSE が読むのは javax.net.ssl.trustStore で、-Djavax.net.ssl.truststore は使われない。本番の行がこのとおりなら、**EXTRASLB_TRUSTSTORE_PATH の独自トラストストアは使われておらず**、パスワードと型だけが JDK の cacerts に対して使われている。
+- パスワードが cacerts と合わない、または型が空だと、JVM 既定の TrustManager を作れない。WildFly 26 では HTTPS 用の SSL コンテキスト（applicationSSC）が起動に失敗し、それに依存する Web のサービスも止まってアプリが 404 になった。JBoss の構成によっては起動時には失敗せず、アプリが JVM 既定の SSLContext で外部へ HTTPS 接続するときに初めて失敗する（EAP 7.4 の実機では未確認）。
+- 本リポジトリの対応: 綴りは本番のままにした。勝手に直すと、今まで使われていなかった独自トラストストアが急に使われ始め、cacerts にしか無い CA の接続先へ TLS で接続できなくなる恐れがあるため。EXTRASLB_TRUSTSTORE_TYPE が空のときは WARN を出し、base の Dockerfile に既定値 JKS を置いた（JDK 9 以降の JKS 型は、keystore.type.compat=true の既定により PKCS12 形式の cacerts も読める）。
+- **本番で確認してほしいこと:** (a) 実際の起動行が trustStore（大文字 S）か truststore（小文字）か。(b) 小文字なら、独自トラストストアが必要な接続先へ本当に接続できているか（cacerts の CA だけで足りているのか）。(c) EXTRASLB_TRUSTSTORE_PASSWORD が changeit 以外なら、起動ログの ERROR（SSL コンテキスト）や、外部への HTTPS 接続のエラーが出ていないか。直す場合は -Djavax.net.ssl.trustStore に変え、独自トラストストアに必要な CA（cacerts から引き継ぐ分を含む）がそろっていることを確かめてから切り替える。
 
 ---
 

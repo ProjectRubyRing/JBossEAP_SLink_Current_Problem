@@ -53,12 +53,14 @@ LP
   echo '<server/>' > "$SD/configuration-seed/standalone.xml"
   # ビルド時に焼き込む 2 段リンクの入口 (front/back の Dockerfile と同じ形)
   ln -s "$MID/current" "$SD/log"
-  # 疑似 standalone.sh: 引数 1 つずつ [] で囲んで出す + 環境
+  # 疑似 standalone.sh: 自分のパス、引数 1 つずつ [] で囲んだもの、環境を出す
   cat > "$JH/bin/standalone.sh" <<'SS'
 #!/bin/sh
+echo "SCRIPT=$0"
 for a in "$@"; do echo "ARG[$a]"; done
 echo "JBOSS_LOG_DIR=${JBOSS_LOG_DIR:-<unset>}"
 echo "LOG_ID_SOURCE=${LOG_ID_SOURCE:-<unset>}"
+echo "JAVA_OPTS=${JAVA_OPTS:-<unset>}"
 SS
   chmod +x "$JH/bin/standalone.sh"
 }
@@ -121,12 +123,12 @@ for SH in "${SHELLS[@]}"; do
   check "rc=0 かつ 1 番目の引数が -Djboss.server.log.dir" '[ $RC -eq 0 ] && [ "$(grep -m1 "^ARG\[" <<<"$OUT")" = "ARG[-Djboss.server.log.dir=$D]" ]'
   rm -rf "$R"
 
-  echo "  [2] CMD が standalone.sh 以外 → WARN のみ (-D は付けない) / JBOSS_LOG_DIR は export"
+  echo "  [2] CMD が eap / standalone.sh 以外 → WARN のみ (-D は付けない。そのまま exec) / JBOSS_LOG_DIR は export"
   mkroot
   run_ep -- sh -c 'for a in "$@"; do echo "ARG[$a]"; done; echo "JBOSS_LOG_DIR=${JBOSS_LOG_DIR:-<unset>}"' sh -b 0.0.0.0
   D=$(own_dir)
   check "rc=0" '[ $RC -eq 0 ]'
-  check "WARN: CMD が standalone.sh ではない" 'grep -q "WARN: CMD が standalone.sh ではないため" <<<"$OUT"'
+  check "WARN: CMD が eap / standalone.sh ではない" 'grep -q "WARN: CMD が eap / standalone.sh ではないため" <<<"$OUT"'
   check "引数は変更なし" '[ "$(grep "^ARG\[" <<<"$OUT" | tr "\n" "|")" = "ARG[-b]|ARG[0.0.0.0]|" ]'
   check "JBOSS_LOG_DIR=<実体パス>" 'grep -qx "JBOSS_LOG_DIR=$D" <<<"$OUT"'
   rm -rf "$R"
@@ -141,6 +143,39 @@ for SH in "${SHELLS[@]}"; do
   mkroot
   run_ep "JAVA_OPTS=-Xmx64m -Djboss.server.log.dir=/manual/dir" -- "$JH/bin/standalone.sh" -b 0.0.0.0
   check "rc=0 / pin しない" '[ $RC -eq 0 ] && grep -q "明示指定されているため pin を適用しません" <<<"$OUT" && [ "$(grep -m1 "^ARG\[" <<<"$OUT")" = "ARG[-b]" ]'
+  rm -rf "$R"
+
+  echo "  [3c] JAVA_OPTS に本番と同じ -Djboss.server.log.dir=<JBOSS_HOME>/standalone/log → 共有の置き場なので pin で上書き"
+  mkroot
+  run_ep "JAVA_OPTS=-Xmx64m -Djboss.server.log.dir=$JH/standalone/log" -- "$JH/bin/standalone.sh" -b 0.0.0.0
+  D=$(own_dir)
+  check "rc=0 / 1 番目の引数が pin" '[ $RC -eq 0 ] && [ "$(grep -m1 "^ARG\[" <<<"$OUT")" = "ARG[-Djboss.server.log.dir=$D]" ]'
+  check "上書きの note に出どころと値" 'grep -q "note: 共有の置き場 (current 経由) を指す -Djboss.server.log.dir の指定 (JAVA_OPTS: $JH/standalone/log) は pin で上書きします" <<<"$OUT"'
+  check "明示指定優先の WARN は出ない" '! grep -q "pin を適用しません" <<<"$OUT"'
+  check "JAVA_OPTS は変えずに渡す / JBOSS_LOG_DIR=<実体パス>" 'grep -qx "JAVA_OPTS=-Xmx64m -Djboss.server.log.dir=$JH/standalone/log" <<<"$OUT" && grep -qx "JBOSS_LOG_DIR=$D" <<<"$OUT"'
+  rm -rf "$R"
+
+  echo "  [3d] 引用符付き・末尾 / ・mid/current の直指定も共有の置き場と判定"
+  mkroot
+  run_ep "JAVA_OPTS=-Djboss.server.log.dir=\"$JH/standalone/log/\"" -- "$JH/bin/standalone.sh"
+  check "\"<JBOSS_HOME>/standalone/log/\" → pin" '[ $RC -eq 0 ] && [ "$(grep -m1 "^ARG\[" <<<"$OUT")" = "ARG[-Djboss.server.log.dir=$(own_dir)]" ]'
+  run_ep "JAVA_OPTS='-Djboss.server.log.dir=$MID/current'" -- "$JH/bin/standalone.sh"
+  check "'<mid>/current' → pin" '[ $RC -eq 0 ] && [ "$(grep -m1 "^ARG\[" <<<"$OUT")" = "ARG[-Djboss.server.log.dir=$(own_dir)]" ]'
+  rm -rf "$R"
+
+  echo "  [3e] 起動引数に共有の置き場を指す -Djboss.server.log.dir → 取り除いてから pin (後ろに残すと pin に勝つため)"
+  mkroot
+  run_ep -- "$JH/bin/standalone.sh" -b 0.0.0.0 "-Djboss.server.log.dir=$JH/standalone/log" -Dx=1
+  D=$(own_dir)
+  check "rc=0 / 引数は pin・-b 0.0.0.0・-Dx=1 だけ" '[ $RC -eq 0 ] && [ "$(grep "^ARG\[" <<<"$OUT" | tr "\n" "|")" = "ARG[-Djboss.server.log.dir=$D]|ARG[-b]|ARG[0.0.0.0]|ARG[-Dx=1]|" ]'
+  check "note の出どころは起動引数" 'grep -q "(起動引数: $JH/standalone/log) は pin で上書きします" <<<"$OUT"'
+  rm -rf "$R"
+
+  echo "  [3f] mid の外の実在するディレクトリを明示 → 運用者の指定として尊重 (pin しない)"
+  mkroot
+  mkdir -p "$R/var/jboss-log"
+  run_ep "JAVA_OPTS=-Djboss.server.log.dir=$R/var/jboss-log" -- "$JH/bin/standalone.sh" -b 0.0.0.0
+  check "rc=0 / WARN に値 / pin 無し / JBOSS_LOG_DIR 未設定" '[ $RC -eq 0 ] && grep -q "WARN: -Djboss.server.log.dir=$R/var/jboss-log が明示指定されているため pin を適用しません" <<<"$OUT" && [ "$(grep -m1 "^ARG\[" <<<"$OUT")" = "ARG[-b]" ] && grep -qx "JBOSS_LOG_DIR=<unset>" <<<"$OUT"'
   rm -rf "$R"
 
   echo "  [4] JBOSS_LOG_PIN=off → 従来どおり current 経由 (WARN)"
@@ -213,6 +248,14 @@ for SH in "${SHELLS[@]}"; do
       /usr/local/bin/efs-entrypoint-taskid.sh "$3/bin/standalone.sh" -b 0.0.0.0' sh "$EP" "$WRAP" "$JH" "$EFS" "http://127.0.0.1:$META_PORT/v4/ok" 2>&1); RC=$?
   D=$(own_dir)
   check "rc=0 / LOG_ID=タスク ID / LOG_ID_SOURCE=taskid / pin 有効" '[ $RC -eq 0 ] && [ "$(basename "$D")" = 0123456789abcdef0123456789abcdef ] && grep -qx "LOG_ID_SOURCE=taskid" <<<"$OUT" && [ "$(grep -m1 "^ARG\[" <<<"$OUT")" = "ARG[-Djboss.server.log.dir=$D]" ]'
+  OUT=$(unshare -rm $SH -c '
+    mount -t tmpfs tmpfs /usr/local/bin || exit 97
+    cp "$1" /usr/local/bin/efs-entrypoint.sh && cp "$2" /usr/local/bin/efs-entrypoint-taskid.sh
+    chmod 755 /usr/local/bin/efs-entrypoint.sh /usr/local/bin/efs-entrypoint-taskid.sh
+    exec env -i PATH="$PATH" HOME=/tmp JBOSS_HOME="$3" JBOSS_CONF_DIR="$3/standalone/configuration" JBOSS_CONF_SEED_DIR="$3/standalone/configuration-seed" \
+      EFS_LOG_DIR="$4" COMPONENT_ROLE=back ECS_CONTAINER_METADATA_URI_V4="$5" SERVER_CONFIG=standalone.xml \
+      /usr/local/bin/efs-entrypoint-taskid.sh eap' sh "$EP" "$WRAP" "$JH" "$EFS" "http://127.0.0.1:$META_PORT/v4/ok" 2>&1); RC=$?
+  check "ラッパー経由の CMD=eap: rc=0 / 同じタスク ID のディレクトリ / pin → -b 0.0.0.0" '[ $RC -eq 0 ] && [ "$(own_dir)" = "$D" ] && [ "$(grep "^ARG\[" <<<"$OUT" | head -3 | tr "\n" "|")" = "ARG[-Djboss.server.log.dir=$D]|ARG[-b]|ARG[0.0.0.0]|" ]'
   OUT=$(unshare -rm $SH -c '
     mount -t tmpfs tmpfs /usr/local/bin || exit 97
     cp "$1" /usr/local/bin/efs-entrypoint.sh; chmod 755 /usr/local/bin/efs-entrypoint.sh
@@ -295,6 +338,88 @@ for SH in "${SHELLS[@]}"; do
   rm -rf "$SD/configuration-seed"
   run_ep -- "$JH/bin/standalone.sh"
   check "seed 無し → rc=1" '[ $RC -eq 1 ] && grep -q "seed ディレクトリ .* がありません" <<<"$OUT"'
+  rm -rf "$R"
+
+  # ---- CMD=eap (本番の起動方式) ----------------------------------------------
+  EAP_FIXED="ARG[-b]|ARG[0.0.0.0]|ARG[-bmanagement]|ARG[0.0.0.0]|ARG[-c]|ARG[standalone.xml]|"
+
+  echo "  [15] CMD=eap → 本番と同じ引数で \$JBOSS_HOME/bin/standalone.sh を起動し、コマンド直後に pin"
+  mkroot
+  run_ep SERVER_CONFIG=standalone.xml EXTRASLB_TRUSTSTORE_PATH=/opt/ts/extra.jks "EXTRASLB_TRUSTSTORE_PASSWORD=pa ss" \
+         EXTRASLB_TRUSTSTORE_TYPE=JKS "JBOSS_SERVER_OPTS=-Dx=1  -Dy=a*b" -- eap
+  D=$(own_dir)
+  check "rc=0 / 起動したのは \$JBOSS_HOME/bin/standalone.sh" '[ $RC -eq 0 ] && grep -qx "SCRIPT=$JH/bin/standalone.sh" <<<"$OUT"'
+  check "引数: pin → 本番と同じ並び → JBOSS_SERVER_OPTS を空白で分割" '[ "$(grep "^ARG\[" <<<"$OUT" | tr "\n" "|")" = "ARG[-Djboss.server.log.dir=$D]|${EAP_FIXED}ARG[-Djavax.net.ssl.truststore=/opt/ts/extra.jks]|ARG[-Djavax.net.ssl.trustStorePassword=pa ss]|ARG[-Djavax.net.ssl.trustStoreType=JKS]|ARG[-Dx=1]|ARG[-Dy=a*b]|" ]'
+  check "JBOSS_LOG_DIR=<実体パス> / log pin 行" 'grep -qx "JBOSS_LOG_DIR=$D" <<<"$OUT" && grep -q "log pin: JBoss は $D へ直接書き込みます" <<<"$OUT"'
+  check "preflight 行は実際の起動行 (パスワードは ****)" 'grep -qF "preflight OK. starting: $JH/bin/standalone.sh -Djboss.server.log.dir=$D -b 0.0.0.0 -bmanagement 0.0.0.0 -c standalone.xml -Djavax.net.ssl.truststore=/opt/ts/extra.jks -Djavax.net.ssl.trustStorePassword=**** -Djavax.net.ssl.trustStoreType=JKS -Dx=1 -Dy=a*b" <<<"$OUT"'
+  check "エントリポイント自身の出力にパスワードが出ない" '! grep "^\[efs-entrypoint" <<<"$OUT" | grep -q "pa ss"'
+  check "EXTRASLB_TRUSTSTORE_TYPE があれば WARN は出ない" '! grep -q "WARN: EXTRASLB_TRUSTSTORE_TYPE が空です" <<<"$OUT"'
+  rm -rf "$R"
+
+  echo "  [15b] CMD=eap・EXTRASLB_* と JBOSS_SERVER_OPTS が未設定 → set -u でも止まらず、本番と同じく空の値で渡す"
+  mkroot
+  run_ep SERVER_CONFIG=standalone.xml -- eap
+  D=$(own_dir)
+  check "rc=0 / 引数 (値が空の -D を含む)" '[ $RC -eq 0 ] && [ "$(grep "^ARG\[" <<<"$OUT" | tr "\n" "|")" = "ARG[-Djboss.server.log.dir=$D]|${EAP_FIXED}ARG[-Djavax.net.ssl.truststore=]|ARG[-Djavax.net.ssl.trustStorePassword=]|ARG[-Djavax.net.ssl.trustStoreType=]|" ]'
+  check "EXTRASLB_TRUSTSTORE_TYPE が空 → WARN (止めない)" 'grep -q "WARN: EXTRASLB_TRUSTSTORE_TYPE が空です" <<<"$OUT"'
+  check "空のパスワードは伏せない (未設定と分かる)" 'grep -qF -- "-Djavax.net.ssl.trustStorePassword= -Djavax.net.ssl.trustStoreType=" <<<"$(grep "preflight OK" <<<"$OUT")"'
+  rm -rf "$R"
+
+  echo "  [15c] CMD=eap + JAVA_OPTS に本番と同じ -Djboss.server.log.dir=\${JBOSS_HOME}/standalone/log → pin で上書き"
+  mkroot
+  run_ep SERVER_CONFIG=standalone.xml "JAVA_OPTS=-Xms64m -Djboss.server.log.dir=$JH/standalone/log" -- eap
+  D=$(own_dir)
+  check "rc=0 / 1 番目の引数が pin / 起動引数の -Djboss.server.log.dir は 1 つだけ" '[ $RC -eq 0 ] && [ "$(grep -m1 "^ARG\[" <<<"$OUT")" = "ARG[-Djboss.server.log.dir=$D]" ] && [ "$(grep -c "^ARG\[-Djboss.server.log.dir=" <<<"$OUT")" -eq 1 ]'
+  check "note (JAVA_OPTS) が出て、明示指定優先の WARN は出ない" 'grep -q "(JAVA_OPTS: $JH/standalone/log) は pin で上書きします" <<<"$OUT" && ! grep -q "pin を適用しません" <<<"$OUT"'
+  check "JAVA_OPTS は変えずに渡す / JBOSS_LOG_DIR=<実体パス>" 'grep -qx "JAVA_OPTS=-Xms64m -Djboss.server.log.dir=$JH/standalone/log" <<<"$OUT" && grep -qx "JBOSS_LOG_DIR=$D" <<<"$OUT"'
+  rm -rf "$R"
+
+  echo "  [15d] CMD=eap + JBOSS_SERVER_OPTS の -Djboss.server.log.dir: 共有の置き場なら除いて pin、別の場所なら尊重"
+  mkroot
+  run_ep SERVER_CONFIG=standalone.xml "JBOSS_SERVER_OPTS=-Djboss.server.log.dir=$JH/standalone/log -Dx=1" -- eap
+  D=$(own_dir)
+  check "共有: -Djboss.server.log.dir は pin の 1 つだけ・-Dx=1 は残る" '[ $RC -eq 0 ] && [ "$(grep -c "^ARG\[-Djboss.server.log.dir=" <<<"$OUT")" -eq 1 ] && [ "$(grep -m1 "^ARG\[" <<<"$OUT")" = "ARG[-Djboss.server.log.dir=$D]" ] && [ "$(grep "^ARG\[" <<<"$OUT" | tail -1)" = "ARG[-Dx=1]" ]'
+  mkdir -p "$R/var/jboss-log"
+  run_ep SERVER_CONFIG=standalone.xml "JBOSS_SERVER_OPTS=-Djboss.server.log.dir=$R/var/jboss-log" -- eap
+  check "別の場所: pin しない (WARN)・指定はそのまま・JBOSS_LOG_DIR 未設定" '[ $RC -eq 0 ] && grep -q "WARN: -Djboss.server.log.dir=$R/var/jboss-log が明示指定されているため pin を適用しません" <<<"$OUT" && [ "$(grep -m1 "^ARG\[" <<<"$OUT")" = "ARG[-b]" ] && [ "$(grep "^ARG\[" <<<"$OUT" | tail -1)" = "ARG[-Djboss.server.log.dir=$R/var/jboss-log]" ] && grep -qx "JBOSS_LOG_DIR=<unset>" <<<"$OUT"'
+  rm -rf "$R"
+
+  echo "  [15e] CMD=eap + JBOSS_LOG_PIN=off → pin 無し (本番の修正前と同じ引数)"
+  mkroot
+  run_ep SERVER_CONFIG=standalone.xml JBOSS_LOG_PIN=off -- eap
+  check "rc=0 / WARN / 引数は本番と同じ並びのみ" '[ $RC -eq 0 ] && grep -q "WARN: JBOSS_LOG_PIN=off" <<<"$OUT" && [ "$(grep "^ARG\[" <<<"$OUT" | tr "\n" "|")" = "${EAP_FIXED}ARG[-Djavax.net.ssl.truststore=]|ARG[-Djavax.net.ssl.trustStorePassword=]|ARG[-Djavax.net.ssl.trustStoreType=]|" ]'
+  rm -rf "$R"
+
+  echo "  [15f] CMD=eap で SERVER_CONFIG 未設定 → FATAL。current・mid・configuration を触らない"
+  mkroot
+  mkdir -p "$MID/prev-task"; ln -s prev-task "$MID/current"
+  run_ep -- eap
+  check "rc=1 / FATAL / current は prev-task のまま・新ディレクトリ無し・configuration 未復元" '[ $RC -eq 1 ] && grep -q "FATAL: CMD=eap ですが SERVER_CONFIG" <<<"$OUT" && [ "$(readlink "$MID/current")" = prev-task ] && [ "$(ls "$MID" | wc -l)" -eq 2 ] && [ ! -f "$SD/configuration/standalone.xml" ]'
+  rm -rf "$R"
+
+  echo "  [15g] CMD=eap: SERVER_CONFIG のファイルの有無を確認 / standalone.sh が無ければ FATAL"
+  mkroot
+  run_ep SERVER_CONFIG=standalone-full.xml -- eap
+  check "seed に無い → rc=1" '[ $RC -eq 1 ] && grep -q "standalone-full.xml がありません" <<<"$OUT"'
+  cp "$SD/configuration-seed/standalone.xml" "$SD/configuration-seed/standalone-full.xml"
+  run_ep SERVER_CONFIG=standalone-full.xml -- eap
+  check "seed にある → rc=0 / -c standalone-full.xml" '[ $RC -eq 0 ] && grep -A1 -x "ARG\[-c\]" <<<"$OUT" | grep -qx "ARG\[standalone-full.xml\]"'
+  rm "$JH/bin/standalone.sh"
+  run_ep SERVER_CONFIG=standalone.xml -- eap
+  check "standalone.sh 無し → rc=1" '[ $RC -eq 1 ] && grep -q "bin/standalone.sh がありません" <<<"$OUT"'
+  rm -rf "$R"
+
+  echo "  [15i] 起動コマンドが空 (entryPoint だけ上書きして command を付け忘れた) → FATAL。current を触らない"
+  mkroot
+  mkdir -p "$MID/prev-task"; ln -s prev-task "$MID/current"
+  run_ep SERVER_CONFIG=standalone.xml --
+  check "rc=1 / FATAL / current は prev-task のまま・新ディレクトリ無し" '[ $RC -eq 1 ] && grep -q "FATAL: 起動コマンド (CMD) がありません" <<<"$OUT" && [ "$(readlink "$MID/current")" = prev-task ] && [ "$(ls "$MID" | wc -l)" -eq 2 ]'
+  rm -rf "$R"
+
+  echo "  [15h] CMD=eap の後ろの引数は使わない (本番と同じ。WARN は伏せ字付き)"
+  mkroot
+  run_ep SERVER_CONFIG=standalone.xml -- eap --debug -Dfoo.password=zzz
+  check "rc=0 / WARN / 引数に含まれない" '[ $RC -eq 0 ] && grep -qF "WARN: CMD=eap の後ろの引数は使いません (本番と同じ): --debug -Dfoo.password=****" <<<"$OUT" && ! grep -q "^ARG\[--debug\]" <<<"$OUT" && ! grep -q "zzz" <<<"$OUT"'
   rm -rf "$R"
 done
 

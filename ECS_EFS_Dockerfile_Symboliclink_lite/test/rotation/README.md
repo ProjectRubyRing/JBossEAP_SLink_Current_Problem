@@ -16,6 +16,12 @@
   数分後が JVM にとっての 0 時になるようにする（時計そのものは実時刻）。
 - 検証用 JSP（`/ticker/log.jsp?who=…`）で任意の時点に `TICK who=…` を 1 行出し、
   最後に共有ボリューム上の `mid/*/server.log*` の中身と `/proc/<java>/fd` を記録する。
+- front／back のイメージの CMD は本番と同じ `eap`（エントリポイントが `standalone.sh -b 0.0.0.0
+  -bmanagement 0.0.0.0 -c "${SERVER_CONFIG}" …` で起動する）。`SERVER_CONFIG=standalone.xml` と
+  `EXTRASLB_TRUSTSTORE_TYPE=JKS` は base の Dockerfile の ENV で入る。本番と同じく `JAVA_OPTS` に
+  `-Djboss.server.log.dir=/opt/jboss-eap/standalone/log` を入れた状態を試すには、`scenario.sh` の
+  `-e JAVA_OPTS=…` の末尾にその指定を足す（Docker を使わない `test/local/rotation_local.sh` では
+  `T_JAVA_OPTS_LOG_DIR=1` で同じことができる。2026-09-27 に実施した結果は `test/local/README.md`）。
 
 ## 使い方
 
@@ -40,7 +46,7 @@ cat results/fixed-S1.log results/legacy-S1.log
 | `S2` | A・B が 0 時をまたいで稼働し、A が先にログを書く | 修正前・修正後 (26.1.3) で実施 |
 | `S2r` | 同上で B が先にログを書く | 修正前 (26.1.3) で実施 |
 | `R1` | 0 時とは無関係。旧タスク A の `:reload` と `:shutdown(restart=true)` | 未実施 |
-| `R2` | 0 時前にクラッシュ → 0 時後に同じコンテナを再起動（ECS restartPolicy 相当）。`--network <label>-net --entrypoint /usr/local/bin/efs-entrypoint-taskid.sh -e ECS_CONTAINER_METADATA_URI_V4=http://<label>-meta:8000/v4/fake` を付けるとタスク ID 方式 | 未実施 |
+| `R2` | 0 時前にクラッシュ → 0 時後に同じコンテナを再起動（ECS restartPolicy 相当）。`--network <label>-net -e LOG_ID_SOURCE=taskid -e ECS_CONTAINER_METADATA_URI_V4=http://<label>-meta:8000/v4/fake` を付けるとタスク ID 方式（`--entrypoint` で上書きするとイメージの CMD `eap` が消えて起動コマンドが空になるため、環境変数で切り替える） | 未実施 |
 
 期待する結果: `JBOSS_LOG_PIN=on`（既定）では、各 `mid/<LOG_ID>/` に自分の
 `server.log.<前日>` と `server.log` だけが並ぶ。`JBOSS_LOG_PIN=off`（旧挙動）では、

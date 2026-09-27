@@ -25,6 +25,22 @@ ENV JBOSS_HOME=${JBOSS_HOME} \
     JBOSS_CONF_DIR=${JBOSS_HOME}/standalone/configuration \
     JBOSS_CONF_SEED_DIR=${JBOSS_HOME}/standalone/configuration-seed
 
+# front / back の CMD は本番と同じ "eap"。このときエントリポイントは
+#   standalone.sh -b 0.0.0.0 -bmanagement 0.0.0.0 -c "${SERVER_CONFIG}"
+#     -Djavax.net.ssl.truststore=... -Djavax.net.ssl.trustStorePassword=...
+#     -Djavax.net.ssl.trustStoreType=... ${JBOSS_SERVER_OPTS}
+# で JBoss を起動する (実体パスへの固定 -Djboss.server.log.dir も付ける)。
+# SERVER_CONFIG は本番で使う設定ファイル名に合わせる (タスク定義の environment でも上書き可)。
+# EXTRASLB_TRUSTSTORE_PATH / _PASSWORD / _TYPE と JBOSS_SERVER_OPTS はタスク定義で渡す
+# (パスワードは secrets = Secrets Manager / SSM パラメータストアを推奨)。
+# EXTRASLB_TRUSTSTORE_TYPE だけは既定値を置く。空のまま起動すると
+# -Djavax.net.ssl.trustStoreType= (空) が JVM に渡って既定のトラストストアを読めなくなり、
+# WildFly 26 では HTTPS の SSL コンテキスト (applicationSSC) が起動に失敗して、
+# それに依存する Web のサービスも止まる (アプリが 404。実機で確認)。
+# JKS 型は JDK 9 以降、PKCS12 形式の cacerts も読める。
+ENV SERVER_CONFIG=standalone.xml \
+    EXTRASLB_TRUSTSTORE_TYPE=JKS
+
 # EFS のマウントポイント。ECS がマウントするため空ディレクトリでよいが、
 # イメージ内に存在させておくことでローカル起動時 (-v なし) でも
 # シンボリックリンク切れの原因を追いやすくする。
@@ -38,6 +54,8 @@ RUN mkdir -p /mnt/logs /mnt/data /webapp "${JBOSS_HOME}"
 # efs-entrypoint.sh を呼ぶ互換ラッパー。どちらも同じ本体を使うため、
 # 方式を切り替えても configuration 復元・fail-fast・pin は必ず効く。
 # 切り替えはタスク定義 (environment か entryPoint) で行い、再ビルドは不要。
+# entryPoint を上書きするとイメージの CMD (eap) は引き継がれないので、
+# その場合はタスク定義の command に ["eap"] も指定すること。
 # ※ entrypoint.taskid.sh を efs-entrypoint.sh という名前で COPY しないこと
 #   (ラッパーが自分自身を呼ぶため起動時に FATAL で停止する)。
 COPY entrypoint.sh        /usr/local/bin/efs-entrypoint.sh

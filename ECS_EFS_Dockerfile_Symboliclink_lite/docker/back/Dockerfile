@@ -61,4 +61,5 @@ RUN ls -l /webapp/webapp9mb02/ /opt/jboss-eap/standalone/ | grep -E ' logs| log'
 # USER jboss
 
 ENTRYPOINT ["/usr/local/bin/efs-entrypoint.sh"]
-CMD ["/opt/jboss-eap/bin/standalone.sh", "-b", "0.0.0.0"]
+# 本番と同じ起動方式 (front の Dockerfile・base の Dockerfile 参照)
+CMD ["eap"]

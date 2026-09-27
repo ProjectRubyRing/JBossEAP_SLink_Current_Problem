@@ -122,11 +122,19 @@ rename と再 open の瞬間だけ `current` を辿り直すため、`current` �
 そこでエントリポイントは、自分のディレクトリを `current` を経由せずに解決し
 (`cd mid/<LOG_ID> && pwd -P`)、JBoss に実体パスを直接渡す (`JBOSS_LOG_PIN=on`、既定)。
 
-- `standalone.sh` の引数に `-Djboss.server.log.dir=<実体パス>` をコマンド直後に挿入する
-  (FILE ハンドラの `relative-to="jboss.server.log.dir"`、Elytron の `audit.log` など)
+- `standalone.sh` の起動行のコマンド直後に `-Djboss.server.log.dir=<実体パス>` を付ける
+  (FILE ハンドラの `relative-to="jboss.server.log.dir"`、Elytron の `audit.log` など)。
+  CMD が `eap` (本番の起動方式。エントリポイントが `standalone.sh -b 0.0.0.0 -bmanagement 0.0.0.0
+  -c "${SERVER_CONFIG}" … ${JBOSS_SERVER_OPTS}` を組み立てて起動する) でも、CMD に
+  `standalone.sh` を直接書いた場合でも付く
 - `JBOSS_LOG_DIR=<実体パス>` を export する (`-Dorg.jboss.boot.log.file` と GC ログ)
 - `logging.properties` に残った `current` 経由・前回 `LOG_ID` の絶対パスを揃える
   (JBoss は起動後にこのファイルを解決済みの絶対パスで書き直すため)
+- `-Djboss.server.log.dir` が `JAVA_OPTS` や起動引数で明示されていても、それが共有の置き場
+  (`/opt/jboss-eap/standalone/log` や `mid/` 配下) を指すなら pin で上書きする。本番の旧
+  エントリポイントが `JAVA_OPTS` に入れていた `-Djboss.server.log.dir=${JBOSS_HOME}/standalone/log`
+  がこれに当たる (JBoss の既定値と同じで current を経由する。削除を推奨。
+  [`LOG_ROTATION.md`](./LOG_ROTATION.md) 10-1)。`mid/` の外を指す明示指定は運用者の意図として尊重する
 
 `current` と `standalone/log` のリンクは、運用者やログ収集の入口
 (「最後に起動したタスク」の目印) として従来どおり張り替える。
@@ -231,7 +239,16 @@ docker build -t interapi-back:latest \
       // ファイル名の日付を決める (未指定のコンテナは UTC = JST 9:00 に切り替わる)。
       { "name": "LOG_ID_SOURCE",  "value": "random" },     // taskid = ECS タスク ID 方式
       { "name": "JBOSS_LOG_PIN",  "value": "on" },         // off は切り分け専用
-      { "name": "TZ",             "value": "Asia/Tokyo" }
+      { "name": "TZ",             "value": "Asia/Tokyo" },
+      // CMD=eap (front / back の既定) で standalone.sh に渡す値 (本番のエントリポイントと同じ)
+      { "name": "SERVER_CONFIG",            "value": "standalone.xml" },   // -c に渡す設定ファイル名
+      { "name": "EXTRASLB_TRUSTSTORE_PATH", "value": "/path/to/truststore.jks" },
+      { "name": "EXTRASLB_TRUSTSTORE_TYPE", "value": "JKS" },
+      { "name": "JBOSS_SERVER_OPTS",        "value": "" }                  // 追加の起動引数 (空白区切り)
+    ],
+    "secrets": [
+      // パスワードは平文の environment ではなく secrets で渡す (起動ログでは **** に伏せる)
+      { "name": "EXTRASLB_TRUSTSTORE_PASSWORD", "valueFrom": "arn:aws:secretsmanager:…" }
     ],
     "mountPoints": [
       { "sourceVolume": "logs", "containerPath": "/mnt/logs" },
@@ -361,7 +378,8 @@ FILE ハンドラも構成されず、`server.log` は作られず標準出力�
 - `standalone/log` の `readlink -f` による dangling 検出
 - 失敗時は `id` / `ls -la standalone` / `mount` / `readlink` の診断ダンプを出力
 
-正常時は CloudWatch に `[efs-entrypoint] preflight OK.` まで 4 行が出る。
+正常時は CloudWatch に `[efs-entrypoint] preflight OK.` まで 5 行が出る
+(`preflight OK. starting:` の後ろは実際に exec する起動行。パスワード類の値は `****` に伏せる)。
 
 ### cp のオプション — ビルド時と起動時で変える
 
@@ -418,7 +436,8 @@ EFS ですらないため、実際に効くのは 1 行目の「非 root 実行�
 | 変数 | 既定 | 意味 |
 |---|---|---|
 | `CONFIG_SEED_MODE` | `overwrite` | `overwrite`=毎起動上書き (推奨) / `missing`=設定ファイルが無いときだけ復元 / `skip`=復元しない |
-| `JBOSS_CONFIG_FILE` | `standalone.xml` | 起動に使う設定ファイル名 |
+| `SERVER_CONFIG` | `standalone.xml` (base の ENV) | CMD=`eap` のとき `standalone.sh -c` に渡す設定ファイル名。CMD=`eap` で未設定なら FATAL |
+| `JBOSS_CONFIG_FILE` | `SERVER_CONFIG` (それも無ければ `standalone.xml`) | 存在を確認する設定ファイル名 |
 | `STRICT_SEED` (build-arg) | `0` | `1` で seed が空のときビルドを失敗させる。CI では必ず `1` |
 
 ### タスク定義の必須要件

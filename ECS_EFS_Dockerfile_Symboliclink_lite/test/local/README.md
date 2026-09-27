@@ -16,15 +16,18 @@ test/local/entrypoint_test.sh "bash --posix"  # シェルを指定
 ```
 
 最後に `RESULT: PASS=… FAIL=0` と出れば合格（失敗があると終了コード 1）。
-2026-09-27 に WSL（Ubuntu 22.04）で `dash`・`bash --posix`・`busybox sh` の 3 種類を試し、**PASS=135 FAIL=0**。
+2026-09-27 に WSL（Ubuntu 22.04）で `dash`・`bash --posix`・`busybox sh` の 3 種類を試し、**PASS=228 FAIL=0**
+（午前の版は 135 項目。本番の起動方式 CMD=`eap` と、`JAVA_OPTS` の `-Djboss.server.log.dir` の扱いの試験を追加した）。
 
 主な確認項目:
 
 | # | ケース | 期待する動作 |
 |---|---|---|
 | 1 | 既定（`JBOSS_LOG_PIN=on`）＋ CMD が `…/standalone.sh` | コマンド直後に `-Djboss.server.log.dir=<mid/<LOG_ID> の実体パス>` を挿入。元の引数は順序・空白とも保持。`JBOSS_LOG_DIR` も実体パス |
-| 2 | CMD が standalone.sh 以外 | WARN のみ（引数は変えない）。`JBOSS_LOG_DIR` は export |
-| 3 | `-Djboss.server.log.dir` を引数か `JAVA_OPTS` で明示 | 明示を優先して pin しない（WARN） |
+| 2 | CMD が `eap`／standalone.sh 以外 | WARN のみ（引数は変えずにそのまま exec）。`JBOSS_LOG_DIR` は export |
+| 3 | `-Djboss.server.log.dir` を引数か `JAVA_OPTS` で明示し、その値が `mid/` の外 | 明示を優先して pin しない（WARN に値を出す） |
+| 3c〜3e | `-Djboss.server.log.dir` の値が共有の置き場（`<JBOSS_HOME>/standalone/log`・`mid/current` など。引用符付き・末尾 `/` も） | pin で上書き（note に出どころと値）。`JAVA_OPTS` は変えずに渡し、起動引数にある共有の指定は取り除く |
+| 15〜15h | CMD=`eap`（本番の起動方式） | `$JBOSS_HOME/bin/standalone.sh` を本番と同じ引数（`-b 0.0.0.0 -bmanagement 0.0.0.0 -c "${SERVER_CONFIG}"`・`javax.net.ssl.*` 3 つ・`JBOSS_SERVER_OPTS` を空白で分割）で起動し、コマンド直後に pin。`JAVA_OPTS`／`JBOSS_SERVER_OPTS` の共有の指定は上書き、`mid/` の外は尊重。未設定の変数でも `set -u` で止まらない。`preflight OK` 行と WARN はパスワードを `****` に伏せる。`SERVER_CONFIG` 未設定は FATAL（`current` を触らない）、`-c` のファイルが seed に無い・`standalone.sh` が無いときも FATAL。`eap` の後ろの引数は本番と同じく使わない（WARN）。ラッパー経由（8b）でも同じ |
 | 4 | `JBOSS_LOG_PIN=off` | 従来どおり current 経由（WARN） |
 | 5・6 | `JBOSS_LOG_PIN` / `LOG_ID_SOURCE` の不正値 | FATAL で停止。**current も mid も configuration も触らない** |
 | 7 | `LOG_ID_SOURCE=taskid` | メタデータ v4 の TaskARN（新形式・旧形式・整形 JSON）からタスク ID。取れない・不正な文字を含むときは random で代替。2 回目の起動（restartPolicy 相当）は同じディレクトリを再利用 |
@@ -46,9 +49,23 @@ test/local/rotation_local.sh batch 240 \
   "S1 wf26 legacy-S1 200 JBOSS_LOG_PIN=off"
 cat ~/rotwork/results/fixed-S1.log ~/rotwork/results/legacy-S1.log
 
+# 本番の起動方式 (CMD=eap) と、本番の JAVA_OPTS の -Djboss.server.log.dir=<JBOSS_HOME>/standalone/log を再現する場合
+test/local/rotation_local.sh batch 240 \
+  "S1 wf26 eap-fixed 100 T_CMD=eap T_JAVA_OPTS_LOG_DIR=1" \
+  "S1 wf26 eap-legacy 200 T_CMD=eap T_JAVA_OPTS_LOG_DIR=1 JBOSS_LOG_PIN=off"
+
 # 3) 後片付け (JRE・WildFly・結果をすべて削除)
 test/local/rotation_local.sh clean
 ```
+
+`T_` で始まる指定は試験道具への指示で、タスクの環境変数ではない。
+
+| 指定 | 意味 |
+|---|---|
+| `T_CMD=eap` | CMD に `eap` を渡す（本番の起動方式）。`SERVER_CONFIG=standalone.xml`、`EXTRASLB_TRUSTSTORE_TYPE=JKS`（base の Dockerfile の ENV と同じ）、ポートのずらしは `JBOSS_SERVER_OPTS` で渡す。指定しなければ CMD に `standalone.sh -b 127.0.0.1 …` を直接渡す |
+| `T_JAVA_OPTS_LOG_DIR=1` | 本番のエントリポイントと同じく、`JAVA_OPTS` に `-Djboss.server.log.dir=<JBOSS_HOME>/standalone/log` を入れる |
+
+S1 では、JBoss 本体が実際に使っている `jboss.server.log.dir` を CLI（`:resolve-expression`）で読み、`LOGDIR` 行に記録する。
 
 | シナリオ | 内容 |
 |---|---|
@@ -70,6 +87,14 @@ test/local/rotation_local.sh clean
 | R1 | `JBOSS_LOG_PIN=off` | WildFly 26.1.3 | `:reload` では開き直さない（自分のファイルのまま）。JVM 再起動後は current 経由で **B の `server.log` を開き、2 つの JVM が同じファイルに書く** |
 | R2 | 修正後・`LOG_ID_SOURCE=taskid` | WildFly 26.1.3 | 同じ `mid/<タスクID>` を再利用。起動直後の最初のログで前回分が `server.log.<前日>` に改名され、今回分は新しい `server.log` |
 | R2 | 修正後・random | WildFly 26.1.3 | 新しい `mid/<起動時刻-乱数>` に `server.log` を作成。前回のディレクトリの `server.log` は改名されずに残る |
+| S1 | 修正後・`T_CMD=eap T_JAVA_OPTS_LOG_DIR=1`（本番と同じ起動方式・本番と同じ `JAVA_OPTS`） | WildFly 26.1.3 | 解消: JVM 引数に `-Djboss.server.log.dir` が 2 つ並ぶ（`JAVA_OPTS` 由来のリンクのパス → pin）が、JBoss 本体の値（`LOGDIR`）は `mid/<自分の ID>`。B の fd は最後まで `server.log` |
+| S1 | 修正後・`T_CMD=eap`（`JAVA_OPTS` の指定を削除＝推奨） | WildFly 26.1.3 | 解消: JVM 引数の `-Djboss.server.log.dir` は pin の 1 つだけ |
+| S1 | `JBOSS_LOG_PIN=off`・`T_CMD=eap T_JAVA_OPTS_LOG_DIR=1`（本番の現状） | WildFly 26.1.3 | 再現: JBoss 本体の値は `…/opt/jboss-eap/standalone/log`（リンクのまま。`-Dorg.jboss.boot.log.file` だけは standalone.sh が解決した実体）。B の fd が `server.log.<前日>` に変わり、B の `server.log` には A の停止ログ |
+
+`T_CMD=eap` の初回は `EXTRASLB_TRUSTSTORE_TYPE` を渡しておらず、`-Djavax.net.ssl.trustStoreType=`（空）のために
+JVM 既定のトラストストアを読めず、HTTPS の SSL コンテキスト（`applicationSSC`）が起動に失敗して検証用アプリが 404 になった
+（それでも上の 3 行と同じ結論。起動・停止ログと fd で判定できた）。いまの `T_CMD=eap` は base の Dockerfile と同じ
+`EXTRASLB_TRUSTSTORE_TYPE=JKS` を渡す。詳細は `docs/LOG_ROTATION.md` 10-1 (6)。
 
 ## 注意
 

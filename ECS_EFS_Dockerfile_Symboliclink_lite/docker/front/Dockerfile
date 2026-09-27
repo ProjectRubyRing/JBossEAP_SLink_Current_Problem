@@ -85,5 +85,7 @@ RUN ls -l /webapp/webapp9mf02/ /opt/jboss-eap/standalone/ | grep -E ' logs| log|
 # USER jboss
 
 ENTRYPOINT ["/usr/local/bin/efs-entrypoint.sh"]
-# 実際の起動コマンドに合わせて変更する
-CMD ["/opt/jboss-eap/bin/standalone.sh", "-b", "0.0.0.0"]
+# 本番と同じ起動方式。eap を渡すと、エントリポイントが standalone.sh を決まった引数
+# (-b 0.0.0.0 -bmanagement 0.0.0.0 -c "${SERVER_CONFIG}" ... ${JBOSS_SERVER_OPTS}) で
+# 起動する (base の Dockerfile 参照)。eap 以外を渡すと、そのコマンドをそのまま実行する。
+CMD ["eap"]

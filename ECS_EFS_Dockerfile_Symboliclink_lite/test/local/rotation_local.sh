@@ -11,6 +11,9 @@
 #       lead_sec 秒後が JVM にとっての 0 時になるタイムゾーンを計算し、シナリオを並行実行する。
 #       port_base はシナリオごとに重ならない値 (100, 200, ...)。VAR=VAL はタスクの環境変数
 #       (例: JBOSS_LOG_PIN=off で修正前の挙動、LOG_ID_SOURCE=taskid でタスク ID 方式)。
+#       次の 2 つは試験道具への指示 (T_ で始まる):
+#         T_CMD=eap              本番と同じ起動方式 (entrypoint.sh eap)。既定は CMD に standalone.sh を直接渡す
+#         T_JAVA_OPTS_LOG_DIR=1  本番と同じく JAVA_OPTS に -Djboss.server.log.dir=<JBOSS_HOME>/standalone/log を入れる
 #       結果は $ROTWORK/results/<label>.log
 #   test/local/rotation_local.sh clean     … $ROTWORK を削除
 #
@@ -105,31 +108,47 @@ scenario() {
 
   port_off() { case $1 in A) echo "$PBASE";; B) echo $((PBASE + 1));; esac; }
 
+  has_extra() { case " ${EXTRA_ENV[*]:-} " in *" $1 "*) return 0;; esac; return 1; }
+
   run_task() {  # run_task <A|B> [append]
-    local t=$1 H=$RUN/$1/opt/jboss-eap po; po=$(port_off "$1")
+    local t=$1 H=$RUN/$1/opt/jboss-eap po jopts cmd eap_env=""; po=$(port_off "$1")
     local redir=">"; [ "${2:-}" = append ] && redir=">>"
+    jopts="-Xms32m -Xmx192m -XX:+UseSerialGC -XX:TieredStopAtLevel=1 -Djava.net.preferIPv4Stack=true -Djava.awt.headless=true -Duser.timezone=$TZID"
+    # 本番のエントリポイントと同じく、JAVA_OPTS に既定と同じログ出力先を入れる
+    has_extra T_JAVA_OPTS_LOG_DIR=1 && jopts="$jopts -Djboss.server.log.dir=$H/standalone/log"
+    if has_extra T_CMD=eap; then
+      # 本番と同じ起動方式。SERVER_CONFIG と EXTRASLB_TRUSTSTORE_TYPE は base の Dockerfile の ENV と同じ値
+      # (TYPE が空だと JVM 既定のトラストストアを読めず、HTTPS の SSL コンテキストが起動に失敗する)。
+      # ポートのずらしは JBOSS_SERVER_OPTS で渡す。どれも VAR=VAL の指定 (後ろに置く) で上書きできる
+      eap_env="SERVER_CONFIG=standalone.xml EXTRASLB_TRUSTSTORE_TYPE=JKS JBOSS_SERVER_OPTS=\"-Djboss.socket.binding.port-offset=$po\""
+      cmd="sh \"$EP\" eap"
+    else
+      cmd="sh \"$EP\" \"$H/bin/standalone.sh\" -b 127.0.0.1 -Djboss.socket.binding.port-offset=$po"
+    fi
     (
       cd /tmp || exit 1
       eval "exec env -i PATH=\"$JRE/bin:/usr/bin:/bin\" HOME=\"$RUN/$t/home\" JAVA_HOME=\"$JRE\" \
         JBOSS_HOME=\"$H\" JBOSS_CONF_DIR=\"$H/standalone/configuration\" JBOSS_CONF_SEED_DIR=\"$H/standalone/configuration-seed\" \
         EFS_LOG_DIR=\"$EFSLOG\" COMPONENT_ROLE=back Service_Name=intra-web Component_name=intra-web-front \
-        LAUNCH_JBOSS_IN_BACKGROUND=true \
-        JAVA_OPTS=\"-Xms32m -Xmx192m -XX:+UseSerialGC -XX:TieredStopAtLevel=1 -Djava.net.preferIPv4Stack=true -Djava.awt.headless=true -Duser.timezone=$TZID\" \
-        ${META_ENV:-} ${EXTRA_ENV[*]:-} sh \"$EP\" \"$H/bin/standalone.sh\" -b 127.0.0.1 -Djboss.socket.binding.port-offset=$po $redir \"$RUN/$t.console\" 2>&1"
+        LAUNCH_JBOSS_IN_BACKGROUND=true JAVA_OPTS=\"$jopts\" $eap_env \
+        ${META_ENV:-} ${EXTRA_ENV[*]:-} $cmd $redir \"$RUN/$t.console\" 2>&1"
     ) &
     echo $! > "$RUN/$t.pid"
     disown $! 2>/dev/null || true   # 後片付けの kill -9 で "Killed" を表示させない
     sleep 2
-    log "START $t  $(grep -E 'log dir:|log pin' "$RUN/$t.console" | tail -2 | tr '\n' ' ')"
+    log "START $t  $(grep -E 'log dir:|log pin|note: 共有' "$RUN/$t.console" | tail -3 | tr '\n' ' ')"
   }
 
   java_pid() { ps -o pid= --ppid "$(cat "$RUN/$1.pid")" 2>/dev/null | head -1 | tr -d ' '; }
 
-  wait_boot() {  # wait_boot <A|B> [n]
+  wait_boot() {  # wait_boot <A|B> [n]   (WFLYSRV0026 = started (with errors))
     local n=${2:-1} c
     for _ in $(seq 1 100); do
       c=$(grep -c 'WFLYSRV0025\|WFLYSRV0026' "$RUN/$1.console" 2>/dev/null)
-      [ "${c:-0}" -ge "$n" ] && { log "BOOTED $1 (#$n)"; return 0; }
+      if [ "${c:-0}" -ge "$n" ]; then
+        log "BOOTED $1 (#$n) $(grep -o 'WFLYSRV002[56]' "$RUN/$1.console" | sed -n "${n}p") ERROR 行=$(grep -c ' ERROR ' "$RUN/$1.console")"
+        return 0
+      fi
       sleep 3
     done
     log "BOOT TIMEOUT $1"; return 1
@@ -149,10 +168,23 @@ scenario() {
       | while read -r l; do log "FD    $1 $l"; done
   }
 
-  cmdline() {  # JVM に渡った -D (ログ出力先)
+  cmdline() {  # JVM に渡ったログ出力先の -D と、起動行 (-c / -b / -bmanagement / javax.net.ssl)
     local jp; jp=$(java_pid "$1")
-    [ -n "$jp" ] && tr '\0' '\n' < "/proc/$jp/cmdline" | grep -E 'jboss.server.log.dir|org.jboss.boot.log.file' \
+    [ -n "$jp" ] && tr '\0' '\n' < "/proc/$jp/cmdline" \
+      | awk 'p { print prev " " $0; p = 0; next }
+             /^(-c|-b|-bmanagement)$/ { prev = $0; p = 1; next }
+             /jboss\.server\.log\.dir|org\.jboss\.boot\.log\.file|javax\.net\.ssl/ { print }' \
       | sed "s#$EFSLOG/##" | while read -r l; do log "ARGV  $1 $l"; done
+  }
+
+  logdir() {  # JBoss 本体が実際に使っている jboss.server.log.dir (CLI でサーバ側の式を解決)
+    local H=$RUN/$1/opt/jboss-eap r
+    # shellcheck disable=SC2016  # ${jboss.server.log.dir} はサーバ側で解決させる
+    r=$(env -i PATH="$JRE/bin:/usr/bin:/bin" HOME="$RUN/$1/home" JAVA_HOME="$JRE" JBOSS_HOME="$H" \
+        "$H/bin/jboss-cli.sh" -c --controller="127.0.0.1:$((9990 + $(port_off "$1")))" \
+        --command=':resolve-expression(expression=${jboss.server.log.dir})' 2>&1 \
+        | tr -d '\n' | sed -n 's/.*"result" => "\([^"]*\)".*/\1/p')
+    log "LOGDIR $1 jboss.server.log.dir=${r:-<取得できず>}"
   }
 
   cli() {
@@ -213,9 +245,9 @@ scenario() {
 
   case "$SCN" in
     S1) # 新タスクが 0 時「後」に起動 → その後に旧タスクが停止 (ご報告の症状)
-      wait_until $((MID - 170)); run_task A; wait_boot A; tick A "A:before-midnight"
+      wait_until $((MID - 170)); run_task A; wait_boot A; tick A "A:before-midnight"; logdir A
       wait_until $((MID + 5));  log "---- (0 時を通過: A はアイドルでログ未出力) ----"
-      run_task B; wait_boot B; tick B "B:booted-after-midnight"; fdview B; cmdline B
+      run_task B; wait_boot B; tick B "B:booted-after-midnight"; fdview B; cmdline B; logdir B
       log "---- rolling deploy: 旧タスク A を停止 (SIGTERM → 停止ログ = 0 時以降の最初のレコード) ----"
       stop_task A
       tick B "B:after-A-stopped-1"; tick B "B:after-A-stopped-2"; fdview B

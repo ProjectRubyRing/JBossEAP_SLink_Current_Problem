@@ -246,12 +246,17 @@ done
 
 ```
 [efs-entrypoint] configuration を復元しました (mode=overwrite, 12 エントリ)
-[efs-entrypoint] JBoss EAP log dir: /mnt/logs/intra-web-front/logs/intra-web/mid/20260827104512-x7sk1z0e
+[efs-entrypoint] JBoss EAP log dir: /mnt/logs/intra-web-front/logs/intra-web/mid/20260827104512-x7sk1z0e (LOG_ID_SOURCE=random)
+[efs-entrypoint] log pin: JBoss は /mnt/logs/intra-web-front/logs/intra-web/mid/20260827104512-x7sk1z0e へ直接書き込みます (current は書き込み経路に使いません)
 [efs-entrypoint] log -> /mnt/logs/intra-web-front/logs/intra-web/mid/20260827104512-x7sk1z0e (書き込み可)
-[efs-entrypoint] preflight OK. starting: /opt/jboss-eap/bin/standalone.sh -b 0.0.0.0
+[efs-entrypoint] preflight OK. starting: /opt/jboss-eap/bin/standalone.sh -Djboss.server.log.dir=/mnt/logs/intra-web-front/logs/intra-web/mid/20260827104512-x7sk1z0e -b 0.0.0.0 -bmanagement 0.0.0.0 -c standalone.xml -Djavax.net.ssl.truststore=... -Djavax.net.ssl.trustStorePassword=**** -Djavax.net.ssl.trustStoreType=... ...
 ```
 
-**この 4 行が出ていなければ、出ていない行の直前が失敗箇所**である。
+(CMD=`eap` の場合。`preflight OK` の行は実際に exec する起動行で、パスワード類の値は `****` に伏せる。
+`JAVA_OPTS` に `-Djboss.server.log.dir=/opt/jboss-eap/standalone/log` があると、`log pin` の次に
+`note: 共有の置き場 (current 経由) を指す -Djboss.server.log.dir の指定 (JAVA_OPTS: …) は pin で上書きします` が出る)
+
+**この 5 行が出ていなければ、出ていない行の直前が失敗箇所**である。
 異常時は `FATAL:` 行に続けて `id` / `ls -la standalone` / `mount` /
 `readlink -f log` の診断ダンプが出力される。
 
@@ -329,7 +334,8 @@ RUN set -eu; \
 | `CONF_DIR` への**実書き込み** | ボリューム未マウント (EROFS) / uid gid 不一致 (EACCES) |
 | `CONF_DIR` 配下の**既存エントリの上書き可否** | 残存ファイルは `cp -Rf` が unlink して解消。ディレクトリ側が書けない場合は該当パスを列挙して `exit 1` (3 章 A-1) |
 | `CONF_DIR/logging.properties` | **無いと JBoss が完全に無音で死ぬ** |
-| `CONF_DIR/${JBOSS_CONFIG_FILE}` | 設定ファイル名の不一致 |
+| `CONF_DIR/${JBOSS_CONFIG_FILE}`（既定は `SERVER_CONFIG`） | 設定ファイル名の不一致（CMD=`eap` の `-c` で使うファイルが seed に無い） |
+| CMD=`eap` のとき `SERVER_CONFIG` と `${JBOSS_HOME}/bin/standalone.sh` | `SERVER_CONFIG` 未設定（`-c ""` になる）・JBoss 未導入。**`current` を触る前に**停止する |
 | `standalone/log` の `readlink -f` | 2 段リンクが dangling |
 | `standalone/log` 解決先への実書き込み | `server.log` が作れない＝無音 |
 | `standalone/tmp` `standalone/data` への実書き込み | 起動最初期で死ぬ (B) |
@@ -344,7 +350,8 @@ RUN set -eu; \
 | 変数 | 既定 | 意味 |
 |---|---|---|
 | `CONFIG_SEED_MODE` | `overwrite` | `overwrite`=毎起動上書き（推奨）/ `missing`=設定ファイルが無いときだけ復元 / `skip`=復元しない（configuration を永続化する運用） |
-| `JBOSS_CONFIG_FILE` | `standalone.xml` | 起動に使う設定ファイル名 |
+| `SERVER_CONFIG` | `standalone.xml`（base の ENV） | CMD=`eap` のとき `standalone.sh -c` に渡す設定ファイル名（本番の値に合わせる） |
+| `JBOSS_CONFIG_FILE` | `SERVER_CONFIG`（それも無ければ `standalone.xml`） | 存在を確認する設定ファイル名 |
 
 > `overwrite` は上書きであり、seed に無い残存ファイルの削除は行わない。
 > タスクローカルのエフェメラルボリュームなら毎起動空なので問題にならない。
@@ -417,6 +424,9 @@ RUN set -eu; \
 configuration の復元・fail-fast 検証・ログ出力先の固定 (pin) は同じものが必ず効く。
 entryPoint を `["/usr/local/bin/efs-entrypoint-taskid.sh"]` にしても同じ
 (このファイルは `LOG_ID_SOURCE=taskid` で `efs-entrypoint.sh` を呼ぶ互換ラッパー)。
+**ただしその場合は `"command": ["eap"]` も指定する。** entryPoint を上書きすると、Docker／ECS は
+イメージの CMD (`eap`) を引き継がない。起動コマンドが空だとエントリポイントは
+`current` を触る前に FATAL で止まる (以前は準備だけして exit 0 で終わっていた)。
 
 > 旧版の `entrypoint.taskid.sh` は別実装で「1. configuration の復元」と
 > fail-fast 検証が入っておらず、そのまま使うと本書冒頭の症状 (完全に無音) が
@@ -497,13 +507,23 @@ done
   `-Dorg.jboss.boot.log.file` が実体パス (`/mnt/logs/…/mid/<LOG_ID>`) なら対策済み。
 - fd が `server.log.<前日>` を指している、または起動引数が
   `/opt/jboss-eap/standalone/log` のままなら、修正前のイメージか `JBOSS_LOG_PIN=off`。
+- `JAVA_OPTS` に `-Djboss.server.log.dir=/opt/jboss-eap/standalone/log` を入れている
+  (本番の旧エントリポイントの書き方) と、起動引数に `-Djboss.server.log.dir` が
+  **2 つ**並ぶ (JAVA_OPTS 由来の `/opt/jboss-eap/standalone/log` と、pin の実体パス)。
+  JBoss が採るのは後ろの起動引数 (pin) の方で、実際の値は次で確かめられる
+  (`result` が `/mnt/logs/…/mid/<LOG_ID>` なら対策済み。詳細は `LOG_ROTATION.md` 10-1)。
+
+  ```sh
+  /opt/jboss-eap/bin/jboss-cli.sh -c --command=':resolve-expression(expression=${jboss.server.log.dir})'
+  ```
 
 **対処**: 修正済みの `entrypoint.sh` を含むイメージへ更新する (`JBOSS_LOG_PIN=on` 既定)。
 切り替えデプロイは日中に行い、0 時 (JVM のタイムゾーン) までに修正前のタスクが
 全て停止したことを確認する (修正前のタスクは引き続き `current` 経由で rename するため)。
-CMD を standalone.sh 以外のラッパーにしている場合は、エントリポイントが export する
+CMD を `eap` / standalone.sh 以外のラッパーにしている場合は、エントリポイントが export する
 `JBOSS_LOG_DIR` を使ってラッパーから `-Djboss.server.log.dir="$JBOSS_LOG_DIR"` を渡す
-(起動時に WARN が出る)。
+(起動時に WARN が出る)。`mid/` の外 (例: `/var/log/jboss`) を指す `-Djboss.server.log.dir` を
+明示している場合も pin されない (運用者の指定として尊重し、WARN を出す)。
 
 **すでに名前と中身がずれたファイルの洗い出し**:
 
@@ -535,6 +555,9 @@ done
 - [ ] Compose 側に `read_only: true` + `nocopy: true` を入れて再現テスト済み
 - [ ] 起動後 CloudWatch に `[efs-entrypoint] preflight OK.` が出ている
 - [ ] 起動後 CloudWatch に `[efs-entrypoint] log pin: JBoss は … へ直接書き込みます` が出ている
-      (出ていなければ `JBOSS_LOG_PIN=off` か、CMD が standalone.sh 以外 → 7 章)
+      (出ていなければ `JBOSS_LOG_PIN=off`、CMD が `eap` / standalone.sh 以外、
+      または `mid/` の外を指す `-Djboss.server.log.dir` の明示指定 → 7 章)
+- [ ] CMD=`eap` のタスクで `SERVER_CONFIG` が本番の設定ファイル名になっている
+      (未設定なら `current` を触る前に FATAL で止まる)
 - [ ] JVM のタイムゾーン (`TZ` / `-Duser.timezone`) が、日次ローテーションを
       区切りたいタイムゾーンになっている (未指定のコンテナは UTC)
