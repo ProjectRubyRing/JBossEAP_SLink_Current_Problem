@@ -1,0 +1,4 @@
+# Windows (core.autocrlf=true) でチェックアウトしても、シェルスクリプトは LF のまま取り出す。
+# CRLF になると bash / sh が "$'\r': command not found" で止まるため
+# (entrypoint.sh / entrypoint.taskid.sh は base の Dockerfile でも CR を除去している)。
+*.sh text eol=lf
