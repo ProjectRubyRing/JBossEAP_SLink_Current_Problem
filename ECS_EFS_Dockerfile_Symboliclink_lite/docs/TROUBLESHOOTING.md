@@ -1,5 +1,7 @@
 # トラブルシュート — ECS で server.log に何も出ない / エラーも出ない
 
+> **この文書は pin 方式のものです（2026-09-29 追記）:** GitHub `ProjectRubyRing/ECS_EFS_Dockerfile_Symboliclink_lite` では、この一式は `pin_method/` フォルダにあります。同リポジトリのルートにある同じ名前の文書は、**別の方式（コンテナ専用リンク方式）**の説明です。2 つの違いと、混ぜてはいけない組み合わせは [`../README.md`](../README.md) を参照してください。
+
 対象症状:
 
 > ECS 上でタスクを起動しても `server.log` に一切ログが出力されず、
@@ -525,6 +527,27 @@ CMD を `eap` / standalone.sh 以外のラッパーにしている場合は、�
 (起動時に WARN が出る)。`mid/` の外 (例: `/var/log/jboss`) を指す `-Djboss.server.log.dir` を
 明示している場合も pin されない (運用者の指定として尊重し、WARN を出す)。
 
+**gc.log と access_log.log も同じ** (2026-09-28 追記。`LOG_ROTATION.md` 10-2):
+
+- access_log.log (Undertow のアクセスログ) は日付変更後の最初のリクエストで、gc.log (JVM の GC ログ) は
+  容量 (EAP の既定 3MB) に達するたびに、どちらも「閉じる → パス名で rename → パス名で開き直す」を行う。
+  パスが current を経由していると、新タスクの `access_log.log` が `access_log.<前日>-1.log` に改名されて
+  当日分がそこへ書かれ続けたり、他タスクの `gc.log` が改名・削除されたりする。
+- 既定の書き方なら pin で直る。起動ログに次の note 行が出ていれば、pin を素通りする明示の書き方
+  (`JAVA_OPTS` の `-Xlog`、`standalone.xml` の access-log の `directory`) をエントリポイントが実体パスへ揃えた印:
+
+  ```
+  [efs-entrypoint] note: 共有の置き場を指す GC ログの指定 (JAVA_OPTS: /opt/jboss-eap/standalone/log/gc.log) を /mnt/logs/…/mid/<ID> へ書き換えました
+  [efs-entrypoint] note: access-log (standalone.xml 466 行目) の出力先 directory=/opt/jboss-eap/standalone/log は共有の置き場を指すため、directory=${jboss.server.log.dir} (= /mnt/logs/…/mid/<ID>) に書き換えました
+  ```
+
+- 上の確認コマンドの fd に `gc.log`・`access_log.log` も出る。どちらも `mid/<自分の LOG_ID>/` の下なら対策済み。
+  `-Xlog` の `file=` は `tr '\0' '\n' < /proc/<pid>/cmdline | grep -E '^-Xlog|^-Xloggc'` で見られる。
+- WARN が出た場合: `standalone.conf に共有の置き場 … GC ログの指定` → イメージの standalone.conf を
+  `$JBOSS_LOG_DIR/gc.log` を使う書き方に直す。`access-log … 式を含むため確認できません`／`属性が複数行` →
+  directory を指定しない (既定) か `${jboss.server.log.dir}` の下にする。`全タスクで共有する EFS 上の場所` →
+  複数タスクが同じファイルに書くので、同じく `${jboss.server.log.dir}` の下にする。
+
 **すでに名前と中身がずれたファイルの洗い出し**:
 
 ```sh
@@ -561,3 +584,7 @@ done
       (未設定なら `current` を触る前に FATAL で止まる)
 - [ ] JVM のタイムゾーン (`TZ` / `-Duser.timezone`) が、日次ローテーションを
       区切りたいタイムゾーンになっている (未指定のコンテナは UTC)
+- [ ] `JAVA_OPTS` で GC ログ (`-Xlog:gc…file=` / `-Xloggc:`) を指定している場合、起動ログに GC ログの
+      note 行が出て、JVM の起動引数の `file=` が `mid/<LOG_ID>` の実体パスになっている (7 章)
+- [ ] access-log を有効にしている場合、`directory` を指定しない (既定 `${jboss.server.log.dir}`) か
+      `${jboss.server.log.dir}` の下にしている。絶対パス等で書いていれば起動ログに note 行が出ている (7 章)

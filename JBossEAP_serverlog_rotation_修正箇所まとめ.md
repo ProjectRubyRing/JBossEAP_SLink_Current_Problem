@@ -4,12 +4,14 @@
 |---|---|
 | 目的 | `JBossEAP_serverlog_rotation_current_link.md` / `.xlsx` の「8 章 案 A（実体パスへの固定＝pin）【採用】」と「10 章 実装内容」を、**そのまま動く状態**でこのフォルダに置く。元の `ECS_EFS_Dockerfile_Symboliclink_lite` フォルダにも同じ修正を入れる |
 | このフォルダで管理する実装 | `JBossEAP_SLink_Current_Problem/ECS_EFS_Dockerfile_Symboliclink_lite/`（入れ子の git リポジトリではなく、**このリポジトリの普通のファイル**として管理） |
-| 元フォルダ | `C:\Users\taka_\Claude\ECS_EFS_Dockerfile_Symboliclink_lite`（同じファイルを適用。**ステージ済み・未コミット**） |
+| 元フォルダ | `C:\Users\taka_\Claude\ECS_EFS_Dockerfile_Symboliclink_lite`（2026-09-27 に同じファイルを適用・ステージしたが、同日 12:59 に取り消され、GitHub の main〔`5f13387`、コンテナ専用リンク方式〕に更新された。**2026-09-29 に pin 方式の一式を `pin_method/` フォルダへ置いた〔ステージ済み・未コミット〕** → 14 章） |
 | 修正の基点 | GitHub `ProjectRubyRing/ECS_EFS_Dockerfile_Symboliclink_lite` の `dfe0282`（2026-08-27 の PR #2 マージ。md/xlsx の実装と実機検証はこの版の上で行われた） |
 | 変更量 | 既存 8 ファイル **+515 行／−204 行**、変更なし 1 ファイル、新規 11 ファイル（md/xlsx 記載の新規 7 ＋ 今回追加 4） |
 | 動作確認（今回実施） | 静的検査（shellcheck・構文）／エントリポイント単体試験 **135 項目すべて合格**（dash・bash --posix・busybox sh）／本物の WildFly での実機試験 **10 シナリオすべて期待どおり**（WildFly 26.1.3 ≒ EAP 7.4、41.0.1 ≒ EAP 8.x）。md/xlsx で「未実施」だった項目もすべて確認済みになった |
-| **追加修正（同日午後）** | **本番の起動方式（CMD=`eap`）に合わせた修正と、本番の `JAVA_OPTS` にある `-Djboss.server.log.dir=${JBOSS_HOME}/standalone/log` の扱い → [12 章](#12-追加修正本番の起動方式cmdeapへの対応とjava_optsの-djbossserverlogdirの扱い)**。単体試験は 222 項目に増やしてすべて合格。本番と同じ構成での 0 時またぎの実機試験も実施 |
-| 作成日 | 2026-09-27（12 章は同日午後に追記） |
+| **追加修正（同日午後）** | **本番の起動方式（CMD=`eap`）に合わせた修正と、本番の `JAVA_OPTS` にある `-Djboss.server.log.dir=${JBOSS_HOME}/standalone/log` の扱い → [12 章](#12-追加修正本番の起動方式cmdeapへの対応とjava_opts-の--djbossserverlogdir-の扱い)**。単体試験は 228 項目に増やしてすべて合格。本番と同じ構成での 0 時またぎの実機試験も実施 |
+| **追加修正（2026-09-28）** | **gc.log と Undertow の access_log.log にも同じ対策が要るかを検討し、pin を素通りする明示の書き方（`JAVA_OPTS` の `-Xlog`／`-Xloggc`、`standalone.xml` の access-log の `directory`）をエントリポイントが実体パスへ揃える処理を追加 → [13 章](#13-追加修正2026-09-28gclog-と-undertow-の-access_loglog-への対応)**。単体試験は 333 項目に増やしてすべて合格。本物の WildFly で修正前の再現と修正後の解消を確認。検討の全文は `JBossEAP_gclog_accesslog_rotation_検討.md`／`.xlsx` |
+| **追加（2026-09-29）** | **本番の設定の確認結果（`JAVA_OPTS` に `-Xlog`／`-Xloggc` の明示あり、access-log の `directory` の指定なし）を 13 章に反映。GitHub の main にあるコンテナ専用リンク方式（案 B）は残し、pin 方式（案 A）の一式を、ぶつかるファイルも含めて元リポジトリの `pin_method/` フォルダに置いた。注記は元リポジトリの `README.md`、`pin_method/README.md`、docs 4 つの冒頭 → [14 章](#14-github-の-mainコンテナ専用リンク方式との共存元リポジトリの-pin_method-に-pin-方式を置いた2026-09-29)** |
+| 作成日 | 2026-09-27（12 章は同日午後に追記、13 章は 2026-09-28 に追記、14 章は 2026-09-29 に追記） |
 
 ## 目次
 
@@ -21,10 +23,12 @@
 6. [修正後の処理の流れと、書き込み経路の違い](#6-修正後の処理の流れと書き込み経路の違い)
 7. [動作確認の結果（2026-09-27 実施）](#7-動作確認の結果2026-09-27-実施)
 8. [使い方（ビルド・デプロイ・確認・移行）](#8-使い方ビルドデプロイ確認移行)
-9. [元フォルダで行ったことと、GitHub の main との関係（要判断）](#9-元フォルダで行ったことと-github-の-main-との関係要判断)
+9. [元フォルダで行ったことと、GitHub の main との関係（判断済み）](#9-元フォルダで行ったこととgithub-の-main-との関係判断済み)
 10. [このフォルダ（JBossEAP_SLink_Current_Problem）の git 上の扱い](#10-このフォルダjbosseap_slink_current_problemの-git-上の扱い)
 11. [作業中に気付いた PC 側の注意](#11-作業中に気付いた-pc-側の注意)
-12. [追加修正: 本番の起動方式（CMD=eap）への対応と、JAVA_OPTS の -Djboss.server.log.dir の扱い](#12-追加修正本番の起動方式cmdeapへの対応とjava_optsの-djbossserverlogdirの扱い)
+12. [追加修正: 本番の起動方式（CMD=eap）への対応と、JAVA_OPTS の -Djboss.server.log.dir の扱い](#12-追加修正本番の起動方式cmdeapへの対応とjava_opts-の--djbossserverlogdir-の扱い)
+13. [追加修正（2026-09-28）: gc.log と Undertow の access_log.log への対応](#13-追加修正2026-09-28gclog-と-undertow-の-access_loglog-への対応)
+14. [GitHub の main（コンテナ専用リンク方式）との共存: 元リポジトリの pin_method/ に pin 方式を置いた（2026-09-29）](#14-github-の-mainコンテナ専用リンク方式との共存元リポジトリの-pin_method-に-pin-方式を置いた2026-09-29)
 
 ---
 
@@ -42,7 +46,8 @@
 - **置き場所**: このフォルダの `ECS_EFS_Dockerfile_Symboliclink_lite/` と、元フォルダの両方に**同一内容**で置いた（git に登録される内容＝全 20 ファイルのモードとハッシュが一致することを確認）。
 - **動作確認**: 本物の WildFly を「ECS タスク相当」で 2 つ動かし、JVM の 0 時をまたがせて確認した。修正後は、ご報告の症状（新タスクが前日付ファイルへ追記）も、前日分の消失も起きない。`JBOSS_LOG_PIN=off`（修正前の挙動）にすると、どちらも再現する（7 章）。
 - **【追加修正・12 章】本番の起動方式に合わせた**: 本番の `entrypoint.sh` は最後に「`$1` が `eap` なら `standalone.sh -b 0.0.0.0 -bmanagement 0.0.0.0 -c "${SERVER_CONFIG}" … ${JBOSS_SERVER_OPTS}` を exec、それ以外は `exec "$@"`」で起動する。同じ分岐を最後に置き、`eap` の起動行にも pin を付けるようにした（front／back の CMD も `["eap"]`）。また本番は pin の前に `JAVA_OPTS` へ `-Djboss.server.log.dir=${JBOSS_HOME}/standalone/log` を入れており、午前の版は「明示指定を優先」してこれで **pin をやめてしまう**（＝本番に入れても直らない）ことが分かったので、**共有の置き場（`standalone/log`・`mid/` 配下）を指す指定は pin で上書き**するようにした。この `JAVA_OPTS` の指定は **残したままでも動くが、削除を推奨**（理由と削除前の確認は 12-4）。
-- **要判断（9 章）**: GitHub の `main` には、今日 10:37 付けのコミットとして別方式の実装（`5f13387`、3 段リンク方式＝md の「案 B」）が入っている。元フォルダはその 1 つ前（`dfe0282`）の上に今回の修正（案 A）を載せた状態で、**まだコミットも push もしていない**。どちらの方式を正とするか決めてから push すること。
+- **【追加修正・13 章（2026-09-28）】gc.log と access_log.log**: どちらも server.log と同じく「閉じる → パス名で改名 → パス名で開き直す」でローテーションするため、パスが `current` を通ると同じ事故が起きる（gc.log は他タスクの GC ログを**削除**することもある）。**既定の書き方なら pin で直っている**が、pin を素通りする明示の書き方（`JAVA_OPTS` の `-Xlog`／`-Xloggc`、`standalone.xml` の access-log の `directory` を絶対パスなどで書いたもの）に備えて、エントリポイントがそれも実体パスへ揃えるようにした。**本番の現状（pin なし）では access_log.log の事故が起きている**（gc.log は `JAVA_OPTS` の指定のおかげで偶然起きていない）。検討の全文は `JBossEAP_gclog_accesslog_rotation_検討.md`／`.xlsx`。
+- **要判断（9 章）→ 2026-09-29 に決定（14 章）**: GitHub の `main` には、今日 10:37 付けのコミットとして別方式の実装（`5f13387`、3 段リンク方式＝md の「案 B」）が入っている。元フォルダはその 1 つ前（`dfe0282`）の上に今回の修正（案 A）を載せた状態で、**まだコミットも push もしていない**。どちらの方式を正とするか決めてから push すること。【2026-09-29】GitHub の main（コンテナ専用リンク方式）は残し、pin 方式は元リポジトリの `pin_method/` に置くことになった（14 章）。
 
 ---
 
@@ -55,6 +60,8 @@ JBossEAP_SLink_Current_Problem/                      (このリポジトリ)
 ├── JBossEAP_serverlog_rotation_current_link.md      調査報告書 (変更なし)
 ├── JBossEAP_serverlog_rotation_current_link.xlsx    調査報告書 (変更なし)
 ├── JBossEAP_serverlog_rotation_修正箇所まとめ.md     ＋ 本書
+├── JBossEAP_gclog_accesslog_rotation_検討.md        ＋ [09-28 追加] gc.log・access_log.log の検討書 (13 章)
+├── JBossEAP_gclog_accesslog_rotation_検討.xlsx      ＋ [09-28 追加] 同 (Excel 版)
 └── ECS_EFS_Dockerfile_Symboliclink_lite/             ＋ 実装一式 (元フォルダと同一内容)
     ├── .gitattributes                                ＋ [今回追加] *.sh を LF で取り出す
     ├── docker/
@@ -474,7 +481,10 @@ test/local/rotation_local.sh clean                       # 後片付け
 
 ---
 
-## 9. 元フォルダで行ったことと、GitHub の main との関係（要判断）
+## 9. 元フォルダで行ったことと、GitHub の main との関係（判断済み）
+
+> **【2026-09-29 追記・決定】** GitHub の main（`5f13387`、コンテナ専用リンク方式＝案 B）は**そのまま残し**、pin 方式（案 A）は**ぶつかるファイルも含めて**元リポジトリの `pin_method/` フォルダにまとめた（14 章）。
+> なお、下の表の「ステージ済み」の状態は 2026-09-27 のうちに無くなっている。元フォルダの参照ログ（reflog）には、2026-09-27 12:59:36 に `reset: moving to HEAD`（ステージした修正を作業ツリーごと取り消す操作）、12:59:39 に `pull: Fast-forward`（`5f13387` を取り込む操作）が記録されており、その後の元フォルダは `5f13387` のままだった（2026-09-29 に確認。stash も残っていない）。
 
 > **やさしく言うと:** 元のフォルダにも同じ修正を入れました。ただし GitHub の側には、別の作業で違うやり方で直した版（今日 10:37 のコミット）がすでに入っています。どちらを正式にするか、決めてから push してください。
 
@@ -507,6 +517,8 @@ test/local/rotation_local.sh clean                       # 後片付け
 - **今回**: 入れ子の `.git` を持たない**普通のフォルダ**として実装一式を置き、このリポジトリで直接管理する形にした。gitlink の削除（`git rm --cached`。ファイルは消していない）とファイル 20 個の追加、本書の追加を**ステージ済み（未コミット）**。テスト用スクリプト 4 本は実行権限（100755）付きで登録した。
   - 注意: ステージを取り消して（`git reset` など）から `git add` し直すと、Windows（`core.filemode=false`）では新規ファイルが 100644 で登録される。その場合は `git add --chmod=+x ECS_EFS_Dockerfile_Symboliclink_lite/test/rotation/*.sh ECS_EFS_Dockerfile_Symboliclink_lite/test/local/*.sh` を付け直す（元フォルダでも同様）。
 - 【追記】その後 2026-09-27 12:59 に `eaae068 fix` としてコミットされた。**12 章の追加修正は未コミット**（作業ツリーの変更のみ）。
+- 【追記 2026-09-28】12 章の追加修正は 2026-09-27 15:16 に `5e7343c fix` としてコミットされた。**13 章の追加修正は未コミット**（`ECS_EFS_Dockerfile_Symboliclink_lite/` 配下 9 ファイルの変更と本書の追記、新規の `JBossEAP_gclog_accesslog_rotation_検討.md`／`.xlsx`）。
+- 【追記 2026-09-29】14 章の作業（`ECS_EFS_Dockerfile_Symboliclink_lite/README.md` の追加、docs 4 つの冒頭の注記、`LOG_ROTATION.md`・`test/local/README.md` への本番の確認結果の反映）と、本書・検討書（md／xlsx）の更新も**未コミット**。元リポジトリ側（`pin_method/` とルートの `README.md`）は**ステージ済み・未コミット**（14-6）。
 - 内容を確認して問題なければ、次でコミット・push できる。
 
 ```bash
@@ -722,4 +734,262 @@ test/local/rotation_local.sh batch 240 \
 test/local/rotation_local.sh clean
 ```
 
-- **元フォルダ**（`C:\Users\taka_\Claude\ECS_EFS_Dockerfile_Symboliclink_lite`）には、12 章の追加修正は**入れていない**（このフォルダだけ。9 章の判断と合わせて扱う）。
+- **元フォルダ**（`C:\Users\taka_\Claude\ECS_EFS_Dockerfile_Symboliclink_lite`）には、12 章の追加修正は**入れていない**（このフォルダだけ。9 章の判断と合わせて扱う）。【2026-09-29 追記】14 章のとおり、元リポジトリの `pin_method/` に、12 章・13 章を含む pin 方式一式を置いた（ルートはコンテナ専用リンク方式のまま）。
+
+---
+
+## 13. 追加修正（2026-09-28）：gc.log と Undertow の access_log.log への対応
+
+> **やさしく言うと:** ノートを片付ける係は、日記係（server.log）のほかにもう 2 人いました。お掃除記録係（gc.log）と受付係（access_log.log）です。2 人とも、片付けのときだけ入口の案内板（`current`）を見て道順でノートを探すので、日記係と同じ事故を起こします。いつもの書き方なら、きのう教えた「本当の住所」（pin）が 2 人にもそのまま効きます。ただ、係が「この道順で行け」と書いたメモ（`JAVA_OPTS` の `-Xlog`、`standalone.xml` の access-log の `directory`）を別に持っていると、住所よりメモのほうを使ってしまいます。そこで、朝の準備係（エントリポイント）が、そのメモも本当の住所に書き直すようにしました。
+
+### 13-1. きっかけ（ご依頼）と、検討結果の置き場所
+
+- ご依頼: 「server.log に対する実装と同じように、gc.log、並びに undertow の access_log.log についても実装追加が必要かどうかの検討を追加し、必要な場合には追加実装してください。」
+- 検討の全文（仕組み・歴史・たとえ話・実機の記録・判断の理由・参考資料）は、調査報告書 **`JBossEAP_gclog_accesslog_rotation_検討.md`／`.xlsx`**（このフォルダの直下）にまとめた。実装者向けの要点は `docs/LOG_ROTATION.md` の **10-2**。本章は「どこをどう変えたか」の要約。
+
+### 13-2. 結論
+
+| 項目 | 結論 |
+|---|---|
+| gc.log（JVM の GC ログ） | JVM（HotSpot）が、自分の書いた量が 3MB（EAP の既定）に達するたびに「閉じる → パス名で `gc.log.N` を**削除** → パス名で `gc.log` を `gc.log.N` へ改名 → パス名で開き直す」。0 時とは関係なく起きる。パスが `current` を通ると、他タスクの現役 `gc.log` を改名し、続くそのタスク自身の片付けが自分の GC ログを削除する＝**GC ログが丸ごと消える**（実機で確認）。JBoss EAP は `bin/standalone.conf` の既定で `GC_LOG=true`（gc.log を出す。アップストリームの WildFly は既定で出さない） |
+| access_log.log（Undertow のアクセスログ） | 日付が変わった（JVM のタイムゾーン）後の最初のリクエストで「閉じる → パス名で `access_log.<日付>.log` へ改名（同名があれば `-1`、`-2` …）→ パス名で開き直す」。パスが `current` を通ると **server.log と同じ症状**（新タスクの当日分が `access_log.<前日>-1.log` のような前日付の名前のファイルに書かれ続け、旧タスクの当日分は新タスクのディレクトリへ）。上書きはしないので丸ごとは消えない。さらにファイルを**最初のリクエストで開く**ため、0 時と関係なく、起動後まだリクエストを受けていないタスクが他タスクのファイルに追記し始めることがある（実機で確認） |
+| 本番の現状（pin なし） | **access_log.log は事故が起きている**（access-log の `directory` の既定 `${jboss.server.log.dir}` がリンクのまま＝`current` 経由。desiredCount が 2 以上なら毎晩）。**gc.log も起き得る**（2026-09-29 更新）: 本番の `JAVA_OPTS` には `-Xlog`／`-Xloggc` の明示がある。明示があると standalone.sh は自分の指定を作らず、明示のパスをそのまま JVM に渡すので、出力先が `standalone/log`（リンク）の下なら、容量ローテーションのたびに `current` を辿る（13-4 の G1「pin あり＋`-Xlog` の明示」の修正前の列と同じ条件＝実機で再現）。GC ログの明示が無い構成なら、`JAVA_OPTS` の `-Djboss.server.log.dir=${JBOSS_HOME}/standalone/log` を standalone.sh が `readlink -m` で実体パスに解決し、その値で `-Xlog` の `file=` を作るので起きない（偶然）。本番の access-log は `directory` の指定なし＝上の既定のまま（2026-09-29 確認） |
+| 2026-09-27 の実装（pin）の効き目 | **既定の書き方なら、どちらも直っている**。gc.log は standalone.sh が `$JBOSS_LOG_DIR/gc.log` を使い、access-log の `directory` の既定は `${jboss.server.log.dir}` なので、どちらも pin の実体パスになる（実機で確認） |
+| 追加実装は必要か | **必要**（2026-09-29 更新: 本番の `JAVA_OPTS` に GC ログの明示があるので、gc.log の部分は備えではなく本番に必要。access-log の部分は、本番は `directory` の指定なしなので働かない〔備え〕）。① `JAVA_OPTS`（・`JAVA_TOOL_OPTIONS`・`JDK_JAVA_OPTIONS`）の `-Xlog:…file=<パス>`／`-Xloggc:<パス>` が共有の置き場を指す（standalone.sh は自分の指定を足さず、これをそのまま使う）、② `standalone.xml` の access-log の `directory` が `/opt/jboss-eap/standalone/log` などの絶対パス、`${jboss.server.base.dir}/log`、`relative-to="jboss.server.base.dir"` ＋ `directory="log"` など。どちらも pin があっても事故が起きる（実機で再現）。どちらの書き方でも効くようにした |
+| 追加実装の内容 | エントリポイントの 3-B（pin を適用するとき）で、① のパス部分だけを `mid/<LOG_ID>` の実体パスへ、② の `directory` を `${jboss.server.log.dir}<その下>`（＝pin の値）へ書き換える（`relative-to` は外す）。共有の置き場（`standalone/log`・`mid/` とその下）を指すものだけが対象で、書き換えたら起動ログに `note` 行を出す。判定できない書き方、全タスク共有の EFS を指すもの、イメージの `standalone.conf` の GC ログ指定（読み取り専用で書き換えられない）には `WARN` だけ出す |
+| 実機確認 | WildFly 26.1.3（≒ EAP 7.4）＋ Temurin JRE 11 で、G1（0 時と無関係：起動直後の最初のリクエスト、GC ログのローテーション）と S2r（2 タスクが 0 時をまたぐ）を、修正前（`5e7343c`）と今回の版で比較。**修正前は再現、今回の版は解消**（13-4） |
+| 単体試験 | 228 → **333 項目、すべて合格**（dash／bash --posix／busybox sh） |
+| 移行時の注意 | 修正前のイメージのタスクは、修正後のタスクと並んでいる間も `current` 経由で access_log.log を改名する（server.log と同じ）。切り替えのデプロイは日中に行い、0 時（JVM のタイムゾーン）までに修正前のタスクがすべて止まったことを確認する |
+
+### 13-3. 変更箇所（ファイル別）
+
+`git diff --numstat`（コミット `5e7343c` からの差分。**未コミット**）
+
+| ファイル | +／− | 変更内容 |
+|---|---|---|
+| `docker/base/entrypoint.sh` | +254／−13 | 下の表 |
+| `docs/LOG_ROTATION.md` | +182／−5 | **10-2 を新設**（結論、gc.log と access_log.log の仕組み〔ソースの抜粋付き〕、追加実装の判定ルール、実機結果、確認方法、運用上の注意）。1 章・4-4・8 章・10 章・11 章・13 章に参照と注記 |
+| `docs/DESIGN.md` | +13／−0 | 書き込み経路の図と 3 章の pin の説明に gc.log・access_log.log（既定の書き方は pin で自分のディレクトリへ、明示の書き方はエントリポイントが揃える、standalone.conf の指定は WARN） |
+| `docs/TROUBLESHOOTING.md` | +25／−0 | 7 章に「gc.log と access_log.log も同じ」（症状、`note` 行と `WARN` の読み方、fd と JVM 引数での確認）、8 章のチェックリストに 2 項目（GC ログの明示、access-log の `directory`） |
+| `test/local/entrypoint_test.sh` | +183／−0 | 試験 [16]〜[17h] を追加（1 シェルあたり 35 項目。13-4） |
+| `test/local/rotation_local.sh` | +105／−18 | `GC_LOG=true`（EAP の既定）で起動、`T_ACCESS_LOG`（seed の standalone.xml に access-log を足す。`default`／`literal`／`basedir`）、`T_JAVA_OPTS_GC=1`（`JAVA_OPTS` に GC ログの明示）、`T_EP`（比べるエントリポイント）、G1 シナリオ、gc.log・access_log の記録（fd・スナップショット・`-Xlog` の起動引数） |
+| `test/rotation/fake-eap/make_ticker_war.py` | +26／−4 | 検証用 WAR に `gc.jsp` を追加（`op=gc`：GC を起こす、`op=rotate`：GC ログを今すぐ回す＝`jcmd <pid> VM.log rotate` と同じ処理） |
+| `test/local/README.md`・`test/rotation/README.md` | +41／−4・+4／−0 | 試験項目・使い方・2026-09-28 の結果 |
+
+新規（このフォルダの直下）: `JBossEAP_gclog_accesslog_rotation_検討.md`／`.xlsx`（調査報告書）。本書にも 13 章などを追記した。
+
+**`docker/base/entrypoint.sh` の構成（1024 行。行番号は今回の修正後）**
+
+| 行 | 区分 | 内容 |
+|---|---|---|
+| 26〜27 | 追加 | 「やること」の 3-B に、gc.log と access_log.log の明示指定も実体パスへ揃える旨 |
+| 78〜98 | **追加** | **【gc.log と access_log.log について】**：どちらも「閉じる → パス名で rename → パス名で開き直す」でローテーションすること、既定の書き方は pin だけで足りること、pin を素通りする明示の書き方と、その書き換え方をコードのそばに残した |
+| 146〜147 | 変更 | `JBOSS_LOG_PIN` の説明に「gc.log・access_log.log の共有の置き場を指す指定も揃える」 |
+| 305〜349 | **追加** | 共有の置き場の判定を 1 か所に集めた：`under_mid()`・`shared_log_rest()`（共有の置き場なら 0。`standalone/log` や `mid/<何か>` より下の残りを `SHARED_REST` に返す）・`on_shared_efs()`（全タスク共有の EFS 上の場所か。WARN 用） |
+| 351〜362 | 変更 | `is_shared_log_dir()`（`-Djboss.server.log.dir` の判定）を `shared_log_rest()` を使う形に。`mid/` の下を指す値は、まだ存在しないディレクトリでも共有の置き場と判定するようになった（以前は実在しないと「`mid/` の外」扱いになり、pin をやめていた） |
+| 461〜537 | **追加** | gc.log：`pin_gc_log_var()`（変数の値を空白で区切った字句ごとに `-Xlog:<対象>:[file=]<パス>` と `-Xloggc:<パス>` を探し、共有の置き場を指すパス部分だけを `${LOG_OWN}<残り>/<ファイル名>` へ。引用符付きも可。他の部分は 1 文字も変えない。下のディレクトリを作る）・`warn_gc_conf()`（イメージの standalone.conf の GC ログ指定は WARN）・`pin_gc_logs()`（`JAVA_OPTS`・`JAVA_TOOL_OPTIONS`・`JDK_JAVA_OPTIONS` を順に処理し、書き換えたら note 行） |
+| 539〜631 | **追加** | access_log.log：`LOGDIR_EXPR`（`${jboss.server.log.dir}`）・`xml_attr()`（属性値の取り出し。`"…"`／`'…'`）・`pin_access_log_line()`（1 つの `<access-log …>` の `directory`／`relative-to` から実際の出力先を求め、共有の置き場なら `sed -i` で `directory="${jboss.server.log.dir}<残り>"` に書き換えて `relative-to` を外し、書き換わったことを確かめてから note 行）・`pin_access_log()`（`${CONF_DIR}/${JBOSS_CONFIG_FILE}` の `<access-log` を含む行を順に処理。ヒアドキュメントは使わない） |
+| 862〜866 | 追加 | `EFS_REAL`（`EFS_LOG_DIR` の実体パス。`on_shared_efs()` で使う） |
+| 896〜899 | **追加** | pin を適用するときに `pin_gc_logs` と `pin_access_log` を呼ぶ（`JBOSS_LOG_PIN=off`、または `mid/` の外を指す `-Djboss.server.log.dir` の明示があるときは呼ばない） |
+
+**判定と書き換えの例**（規則の全体は `docs/LOG_ROTATION.md` 10-2 (4)、調査報告書の 10-2）
+
+| 書き方の例 | 判定 | 書き換え後 |
+|---|---|---|
+| `-Xlog:gc*:file=/opt/jboss-eap/standalone/log/gc.log:time,uptimemillis:filecount=5,filesize=3M` | 共有の置き場 | `-Xlog:gc*:file=/mnt/logs/…/mid/<ID>/gc.log:time,uptimemillis:filecount=5,filesize=3M` |
+| `-Xlog:gc*:file="/opt/jboss-eap/standalone/log/gc.log":…`、`'-Xloggc:/opt/jboss-eap/standalone/log/gc.log'` | 共有の置き場 | 引用符はそのまま、中のパスだけ実体パス |
+| `-Xlog:gc*:file=/opt/jboss-eap/standalone/log/gc/heap.log` | 共有の置き場 | `…/mid/<ID>/gc/heap.log`（`gc/` を作る） |
+| `-Xlog:gc*:file=/var/log/gc.log`、`-Xlog:gc:file=gc.log`、`-Xlog:gc*:stdout` | 対象外 | そのまま |
+| `-Xlog:gc*:file=/mnt/logs/<C>/logs/<S>/gc.log` | 全タスク共有の EFS | そのまま（WARN） |
+| `<access-log/>`、`directory="${jboss.server.log.dir}"`、`relative-to="jboss.server.log.dir"` | pin 済み | そのまま |
+| `<access-log directory="/opt/jboss-eap/standalone/log"/>` | 共有の置き場 | `directory="${jboss.server.log.dir}"` |
+| `<access-log relative-to="jboss.server.base.dir" directory="log"/>` | 共有の置き場 | `directory="${jboss.server.log.dir}"`（`relative-to` を外す） |
+| `<access-log directory="${jboss.home.dir}/standalone/log/access"/>` | 共有の置き場 | `directory="${jboss.server.log.dir}/access"` |
+| `<access-log directory="${env.ACCESS_DIR}"/>`、属性が複数行にわたる要素 | 判定できない | そのまま（WARN） |
+
+**起動ログ（本番と同じ CMD=`eap`・`JAVA_OPTS` に `-Djboss.server.log.dir` と `-Xlog` の明示・access-log の `directory` が絶対パスの場合。実機。パスは一部省略）**
+
+```
+[efs-entrypoint] log pin: JBoss は /mnt/logs/…/mid/<ID> へ直接書き込みます (current は書き込み経路に使いません)
+[efs-entrypoint] note: 共有の置き場 (current 経由) を指す -Djboss.server.log.dir の指定 (JAVA_OPTS: /opt/jboss-eap/standalone/log) は pin で上書きします (docs/LOG_ROTATION.md 10-1)
+[efs-entrypoint] note: 共有の置き場を指す GC ログの指定 (JAVA_OPTS: /opt/jboss-eap/standalone/log/gc.log) を /mnt/logs/…/mid/<ID> へ書き換えました (docs/LOG_ROTATION.md 10-2)
+[efs-entrypoint] note: access-log (standalone.xml 466 行目) の出力先 directory=/opt/jboss-eap/standalone/log は共有の置き場を指すため、directory=${jboss.server.log.dir} (= /mnt/logs/…/mid/<ID>) に書き換えました (docs/LOG_ROTATION.md 10-2)
+```
+
+既定の書き方（GC ログの明示なし、access-log の `directory` 省略）なら `note` 行は出ず、12 章までと同じ行だけになる。
+
+### 13-4. 動作確認（2026-09-28）
+
+**静的検査**: `shellcheck -S warning` で entrypoint.sh は警告なし（info の SC2012 が 1 件。修正前からある行）。`dash -n`／`bash --posix -n`／`busybox sh -n` も OK。JBoss の式 `${jboss.server.log.dir}` をシェルが展開しないように `'…'` で書いた箇所には、意図を添えた `shellcheck disable=SC2016` を付けた。
+
+**単体試験**（`test/local/entrypoint_test.sh`）: **PASS=333 FAIL=0 SKIP=0**（dash・bash --posix・busybox sh。既存の 228 項目もすべて合格）。追加した確認:
+
+| # | 確認したこと |
+|---|---|
+| 16〜16b | `JAVA_OPTS` の `-Xlog`（`file=` あり・なし、引用符付き）・`-Xloggc` が `standalone/log`・`mid/current` とその下を指す → パス部分だけ実体パスへ。二重の空白や他の引用符も含めて他は 1 文字も変えない。下のディレクトリを作る。note 行 |
+| 16c・16d | `mid/` の外・相対パス・`stdout`・`-Xlog:disable` → 書き換えない／全タスク共有の EFS → 書き換えずに WARN |
+| 16e | `JAVA_TOOL_OPTIONS`・`JDK_JAVA_OPTIONS`、同じ字句が 2 つ → どちらも・2 つとも書き換える |
+| 16f・16g | `JBOSS_LOG_PIN=off`・`mid/` の外の `-Djboss.server.log.dir` → 書き換えない／CMD=`eap`＋本番と同じ `JAVA_OPTS` → pin・note と GC ログの書き換えが両方効く |
+| 16h | standalone.conf に共有の置き場を指す GC ログの指定 → WARN（行番号付き）。コメント行と `$JBOSS_LOG_DIR` の書き方は WARN しない |
+| 17 | access-log が既定・`${jboss.server.log.dir}`・`relative-to="jboss.server.log.dir"` → 書き換えない |
+| 17b〜17d | `directory` が絶対パス（その下・末尾 `/`・`mid/current`・前回の `LOG_ID`・`'…'` の属性）・`${jboss.server.base.dir}/log`・`${jboss.home.dir}/standalone/log`・`relative-to="jboss.server.base.dir"`／`"jboss.home.dir"` → `directory="${jboss.server.log.dir}<下>"`、`relative-to` を外す。他の属性はそのまま。seed は変えない |
+| 17e・17f | `use-server-log="true"`・`console-access-log`・`relative-to="jboss.server.data.dir"`・`mid/` の外 → 書き換えない／式・全タスク共有の EFS・属性が複数行・`relative-to` だけ → 書き換えずに WARN |
+| 17g・17h | `JBOSS_LOG_PIN=off`・`SERVER_CONFIG=standalone-full.xml` → 書き換えない・`SERVER_CONFIG` のファイルだけ書き換える／`CONFIG_SEED_MODE=skip` で 2 回起動 → 2 回目は何もしない |
+
+**実機試験**（`test/local/rotation_local.sh`、WSL 上の WildFly 26.1.3 ≒ EAP 7.4、Temurin JRE 11.0.32.1。EAP と同じ `GC_LOG=true`）: 「修正前」は `5e7343c` のエントリポイント（pin はあるが gc.log・access-log の書き換えは無い）。
+
+| シナリオ | 構成 | 修正前（`5e7343c`） | 今回の版 |
+|---|---|---|---|
+| G1（A 起動 → B 起動 → A が初めてリクエスト → A・B の GC ログを順に回す） | pin なし（`JBOSS_LOG_PIN=off`）・`JAVA_OPTS` の指定なし | **再現**: A は B の access_log.log を開いた（2 つの JVM が同じファイルへ）。B の現役 gc.log が gc.log.0 に改名され、続いて B が回すと B 自身の GC ログ（266 行）が削除された | ― |
+| G1 | 本番の現状（CMD=`eap`、`JAVA_OPTS` に `-Djboss.server.log.dir`、pin なし） | gc.log は問題なし（standalone.sh が実体パスに解決）・**access_log.log は再現** | ― |
+| G1 | pin あり・既定の書き方 | 問題なし | ― |
+| G1 | pin あり＋`JAVA_OPTS` に `-Xlog` の明示＋access-log の `directory` が絶対パス（本番と同じ CMD=`eap`・`JAVA_OPTS`） | **再現**（`-Xlog` は明示のまま。B の GC ログ 276 行が消失。access_log.log も A が B のファイルを開いた） | **解消**（note 行 2 つ。`-Xlog` の `file=` と access-log がそれぞれ自分のディレクトリ） |
+| G1 | pin あり＋`-Xlog` の明示＋`relative-to="jboss.server.base.dir" directory="log"` | ― | **解消**（`relative-to` を外して `${jboss.server.log.dir}` に） |
+| S2r（A・B が 0 時をまたぐ。B が先にリクエスト） | pin なし・`JAVA_OPTS` の指定なし／本番の現状 | **再現**（どちらも同じ結果）: B の当日分が `access_log.2026-09-27-1.log` へ、A の当日分は B のディレクトリの `access_log.log` へ。A の `access_log.log` は改名されない（server.log も同じ症状） | ― |
+| S2r | pin あり＋`-Xlog` の明示＋access-log の `directory` が絶対パス（本番と同じ CMD=`eap`・`JAVA_OPTS`） | server.log は解消、**access_log.log は再現** | **解消**（A・B とも自分のディレクトリに `access_log.2026-09-27.log`〔前日分〕と `access_log.log`〔当日分〕） |
+
+- 「pin なし」（`JBOSS_LOG_PIN=off`）の行は、修正前と今回の版で動きが同じ（gc.log・access-log の書き換えは pin を適用するときだけ行う）。本番の現状を再現するため、`JBOSS_LOG_PIN=off` か `5e7343c` のエントリポイント（`T_EP`）で動かした。
+- **検証の限界**: 共有ストレージは EFS ではなく WSL の ext4。サーバは JBoss EAP 本体ではなく WildFly 26.1.3（GC ログの出し方は EAP 7.4 の standalone.sh と同一、access-log の既定値と Undertow の改名手順も EAP 7.4.25 のソースと同じことを確認）。GC ログのローテーションは、3MB を実際に書く代わりに `VM.log rotate`（同じ `rotate()` が動く）で起こした。WildFly 41.0.1（≒ EAP 8.x）の実機確認は C: ドライブの空き不足で見送り、ソースで同じ手順・既定値であることを確かめた。
+
+> **「本番の現状」の意味（2026-09-29 追記）:** 上の表の「本番の現状」は、CMD=`eap` で `JAVA_OPTS` に `-Djboss.server.log.dir` がある構成を、**GC ログの明示なし**で動かしたもの。本番の `JAVA_OPTS` には `-Xlog`／`-Xloggc` の明示があるので、本番の gc.log は G1「pin あり＋`-Xlog` の明示」の修正前（`5e7343c`）＝**再現**と同じ側にあたる（明示があると、pin の有無にかかわらず standalone.sh は自分の指定を作らない）。本番の access-log は `directory` の指定なし＝`T_ACCESS_LOG=default` と同じ。
+
+### 13-5. 使い方の変更点・本番で確認してほしいこと
+
+- **ビルド・タスク定義**: 変わらない（新しい環境変数は無い。`JBOSS_LOG_PIN=on`〔既定〕なら自動で効く）。
+- **効いているかの確認**: 起動ログに `log pin` 行が出ること。明示の書き方があれば `note` 行（GC ログ／access-log）も出る。ECS Exec で JVM の fd と起動引数を見る（`docs/LOG_ROTATION.md` 10-2 (6)、`docs/TROUBLESHOOTING.md` 7 章）。access_log.log は最初のリクエストで開くので、fd に出ないときは 1 回アクセスしてから見る。
+- **本番で確認してほしいこと**（2026-09-29 に (a)(b) の結果をいただいた）:
+  - (a) 本番のエントリポイント（`JAVA_OPTS`）・タスク定義（`JAVA_OPTS`／`JAVA_TOOL_OPTIONS`／`JDK_JAVA_OPTIONS`）・イメージの `bin/standalone.conf` に `-Xlog`／`-Xloggc` の明示があるか。standalone.conf のものはエントリポイントから書き換えられないので、`$JBOSS_LOG_DIR/gc.log` を使う書き方に直す（修正版では WARN が出る）。→ **明示あり**（2026-09-29）。残りは正確な値と設定場所（出力先が `standalone/log`・`mid/` の下か、`$JBOSS_HOME` などの変数を文字のまま書いていないか。変数のままだとエントリポイントは判定できず、書き換えない）。
+  - (b) seed の `standalone.xml`（`configuration-seed/<SERVER_CONFIG>`）の `<access-log …>` の `directory`／`relative-to`。共有の置き場を指していれば修正版で自動的に書き換わる（note 行）が、できれば `directory` を省略するか `${jboss.server.log.dir}` の下にする。→ **`directory` の指定なし**（2026-09-29）＝既定の `${jboss.server.log.dir}` なので pin だけで直る。
+  - (c) `GC_LOG` を変えていないか（GC ログの明示が無い場合だけ意味を持つ。`false` なら standalone.sh は gc.log を出さない）。→ 本番は明示があるので、`GC_LOG` の値に関係なく gc.log は明示どおりに出る。
+- **移行**: 13-2 の「移行時の注意」のとおり日中にデプロイする。翌朝、各 `mid/<LOG_ID>/` に `access_log.<前日>.log` と `access_log.log` がそろい、`-1` 付きのファイルが無いことを確かめる（すでにずれたファイルの洗い出し方は調査報告書の 11-4）。
+- **運用上の注意**: `JBOSS_LOG_PIN=off` のまま本番の `JAVA_OPTS` から `-Djboss.server.log.dir` を消さない（GC ログの明示が無い構成では gc.log が `current` 経由になる。pin=off では明示の書き換えも行わないので、本番のように明示がある構成では明示の出力先が `current` 経由に戻る）。pin=on（既定）なら消しても gc.log は実体パスのまま。ログ収集の対象は `mid/*/gc.log*`・`mid/*/access_log*` にする。
+- **試験のやり直し**:
+
+```bash
+test/local/entrypoint_test.sh                  # 333 項目。JBoss 不要
+test/local/rotation_local.sh setup wf26
+# G1 は 0 時と無関係なので、0 時までの秒数は大きめ (900) にする
+test/local/rotation_local.sh batch 900 \
+  "G1 wf26 g1-fixed 100 T_CMD=eap T_JAVA_OPTS_LOG_DIR=1 T_JAVA_OPTS_GC=1 T_ACCESS_LOG=literal" \
+  "G1 wf26 g1-legacy 200 JBOSS_LOG_PIN=off T_ACCESS_LOG=default"
+test/local/rotation_local.sh batch 240 \
+  "S2r wf26 s2r-fixed 100 T_CMD=eap T_JAVA_OPTS_LOG_DIR=1 T_JAVA_OPTS_GC=1 T_ACCESS_LOG=literal" \
+  "S2r wf26 s2r-legacy 200 JBOSS_LOG_PIN=off T_ACCESS_LOG=default"
+test/local/rotation_local.sh clean
+```
+
+- **元フォルダ**（`C:\Users\taka_\Claude\ECS_EFS_Dockerfile_Symboliclink_lite`）には、13 章の追加修正も**入れていない**（12 章と同じく、9 章の判断と合わせて扱う）。【2026-09-29 追記】14 章のとおり、元リポジトリの `pin_method/` に、12 章・13 章を含む pin 方式一式を置いた（ルートはコンテナ専用リンク方式のまま）。
+
+---
+
+## 14. GitHub の main（コンテナ専用リンク方式）との共存：元リポジトリの pin_method/ に pin 方式を置いた（2026-09-29）
+
+> **やさしく言うと:** 同じ名前の道具が 2 種類あって、同じ箱に入れると片方が消えてしまいます。そこで、GitHub の箱（main）に入っていた道具（コンテナ専用リンク方式）はそのままにして、こちらの道具（pin 方式）は `pin_method` という別の引き出しに、説明書といっしょに丸ごと入れました。箱のふたと引き出しの前には「中身が違うので混ぜないで」という札を貼りました。
+
+### 14-1. ご依頼と、決めたこと
+
+- ご依頼（2026-09-29）: 「本番のJAVA_OPTSには、-Xlogや-Xloggcの明示があります。standalone.xmlのaccess-logにはdirectoryの指定はありません。Githubのmainの別方式（案B）も維持して、こちらの実装とぶつかる部分も含めて別フォルダに今回の方式をまとめてください。その辺わかりやすく注記を入れてください。」
+- 前半（本番の設定）は 13 章と検討書に反映した（14-5）。後半（フォルダ分け）は次のように決めた。
+
+| 項目 | 決めたこと | 理由 |
+|---|---|---|
+| 置き場所 | 元リポジトリ `ProjectRubyRing/ECS_EFS_Dockerfile_Symboliclink_lite`（GitHub の main）の **`pin_method/`** | main に 2 つの方式を並べて置ける。push してもコンテナ専用リンク方式を上書きしない |
+| フォルダ名 | `pin_method`（方式の中身から付けた） | 「planA」などにすると、`docs/REJECTED_ALTERNATIVES.md` の「案 A〜D」（別の番号付け）と取り違えやすい |
+| 中身 | このリポジトリの `ECS_EFS_Dockerfile_Symboliclink_lite/`（正本）の 21 ファイルをそのまま写す。ぶつかる 8 ファイル（`entrypoint.sh`・`entrypoint.taskid.sh`・3 つの `Dockerfile`・`DESIGN.md`・`REJECTED_ALTERNATIVES.md`・`TROUBLESHOOTING.md`）も含める | フォルダだけでビルド・試験できるようにする（ルートのファイルを借りない） |
+| ルート（コンテナ専用リンク方式） | 1 文字も変えない。案内の `README.md` だけを新しく置く | 「案 B も維持」のご依頼どおり。GitHub で開いた人が 2 つの方式に気付けるようにする |
+| 正本 | このリポジトリの `ECS_EFS_Dockerfile_Symboliclink_lite/`。変更はこちらで行い、試験してから `pin_method/` へ写す | これまでの「こちらはこちらで実装管理」を保つ。2 か所を別々に直すとずれる |
+| `entrypoint.sh`・`Dockerfile` の中の注記 | 入れない（フォルダ名・README・docs の冒頭で区別する） | 本書 4 章・12 章・13 章の行番号の表を保つため |
+
+### 14-2. 置いたもの（元リポジトリ）
+
+```
+ECS_EFS_Dockerfile_Symboliclink_lite/        元リポジトリ（main = 5f13387 のまま）
+├── README.md                                ★新規: 2 つの方式があることの案内（注記）
+├── docker/  docs/                           変更なし（コンテナ専用リンク方式）
+└── pin_method/                              ★新規: pin 方式一式（正本と同じ 21 ファイル）
+    ├── README.md                            ★注記の本体（14-4）
+    ├── .gitattributes                       *.sh を LF で取り出す
+    ├── docker/base/Dockerfile・entrypoint.sh・entrypoint.taskid.sh
+    ├── docker/front/Dockerfile・docker/back/Dockerfile
+    ├── docs/CP_PRESERVE_OWNERSHIP.md・DESIGN.md・LOG_ROTATION.md・REJECTED_ALTERNATIVES.md・TROUBLESHOOTING.md
+    ├── test/local/README.md・entrypoint_test.sh・rotation_local.sh
+    └── test/rotation/.gitignore・README.md・batch.sh・scenario.sh・fake-eap/Dockerfile・fake-eap/make_ticker_war.py
+```
+
+### 14-3. ぶつかるファイル（同じパスで中身が違う）
+
+| パス | pin 方式（`pin_method/`） | コンテナ専用リンク方式（ルート） |
+|---|---|---|
+| `docker/base/entrypoint.sh` | 実体パスを `-Djboss.server.log.dir` で渡す（起動コマンドの直後）。`JBOSS_LOG_DIR`・`logging.properties` も実体パス。gc.log・access-log の明示の書き換え。`CMD=eap` の起動。変数 `LOG_ID_SOURCE`・`JBOSS_LOG_PIN` | `standalone/tmp/jboss-log-target → mid/<LOG_ID>` を作り、`JBOSS_LOG_DIR` を実体パスにする。最後は `exec "$@"`。変数 `LOG_ID_MODE`・`LOG_LINK_STRICT` |
+| `docker/base/entrypoint.taskid.sh` | `LOG_ID_SOURCE=taskid` を付けて本体を呼ぶ | `LOG_ID_MODE=taskid` を付けて本体を呼ぶ |
+| `docker/base/Dockerfile` | エントリポイント 2 つを COPY。`ENV SERVER_CONFIG`・`EXTRASLB_TRUSTSTORE_TYPE` | エントリポイント 2 つを COPY |
+| `docker/front/Dockerfile`・`docker/back/Dockerfile` | `standalone/log → …/mid/current`（従来のまま）、`CMD ["eap"]` | `standalone/log → tmp/jboss-log-target`、`CMD ["/opt/jboss-eap/bin/standalone.sh", "-b", "0.0.0.0"]` |
+| `docs/DESIGN.md`・`docs/REJECTED_ALTERNATIVES.md`・`docs/TROUBLESHOOTING.md` | pin 方式の説明 | コンテナ専用リンク方式の説明 |
+
+- 片方にしか無いもの: pin 方式だけ＝`docs/LOG_ROTATION.md`・`test/local/`・`test/rotation/`・`.gitattributes`・`README.md`。コンテナ専用リンク方式だけ＝`docs/SERVER_LOG_DATE_ROLLOVER.md`／`.xlsx`・`docker/base/tests/rotation_isolation_test.sh`。
+- 同じ内容: `docs/CP_PRESERVE_OWNERSHIP.md`（どちらも `dfe0282` のまま）。
+- 混ぜた場合（`pin_method/README.md` 5 章）: pin 方式の base ＋ ルートの front／back は、リンク先 `tmp/jboss-log-target` が無いので FATAL で起動しない。ルートの base ＋ pin 方式の front／back は、`CMD ["eap"]` を解釈できず起動しない（どちらもコードからの判断）。環境変数は、相手の方式のものを渡しても黙って無視される。
+
+### 14-4. 注記を入れた場所
+
+| 場所 | 入れた内容 |
+|---|---|
+| 元リポジトリの `README.md`（新規） | 2 つの方式の置き場所・JBoss が書くパス・説明書の表。「同じ名前で中身が違うので片方だけ使う。3 つのイメージは同じフォルダから作る」「ルートは変えていない」「呼び方（案 A／案 B と、REJECTED_ALTERNATIVES.md の案 B は別物）」 |
+| `pin_method/README.md`（新規。正本の `ECS_EFS_Dockerfile_Symboliclink_lite/README.md` と同じ） | 1 置き場所と経緯、2 呼び方の注意、3 ぶつかるファイル、4 2 つの方式の違い（本番の gc.log・access-log への効き方を含む）、5 混ぜてはいけない組み合わせ（コンテナ専用リンク方式を旧イメージで使うときの注意を含む）、6 ビルド・試験（タグを分ける）、7 本番の設定への当てはめ、8 正本と写しの同期、9 参考資料 |
+| `docs/DESIGN.md`・`TROUBLESHOOTING.md`・`REJECTED_ALTERNATIVES.md`・`LOG_ROTATION.md` の冒頭 | 「この文書は pin 方式のもの。元リポジトリのルートにある同じ名前の文書は別の方式の説明」。`REJECTED_ALTERNATIVES.md` にはさらに「本書の案 B（UUID の焼き込み）は、会話でいう案 B（コンテナ専用リンク方式）とは別物」 |
+
+### 14-5. 本番の設定の確認結果（2026-09-29）の反映
+
+| 本番の設定 | 意味 | 反映した場所 |
+|---|---|---|
+| `JAVA_OPTS` に `-Xlog`／`-Xloggc` の明示がある | standalone.sh は明示があると自分の指定を作らず、明示のパスをそのまま JVM に渡す（WildFly Core 18.1.2 の `standalone.sh` で確認）。出力先が `standalone/log` の下なら、**修正前の今の本番でも gc.log の事故が起き得る**（容量ローテーションのたび。0 時と無関係）。13 章の GC ログの書き換えは、備えではなく本番に必要になった。本番の JDK 11 では `-Xloggc` も統合ロギングになり、filecount／filesize を書かなければ 20MB × 5 ファイルで回す（JDK 11 の `arguments.cpp`・`logFileOutput.hpp` で確認） | 13-2・13-4 の注記・13-5、検討書（表紙と 1・3・6・8・9・11 章）、`docs/LOG_ROTATION.md` の冒頭と 10-2、`test/local/README.md`、`README.md` 4 章・7 章 |
+| access-log に `directory` の指定がない | 既定の `${jboss.server.log.dir}` → pin だけで直る。13 章の access-log の書き換えは本番では働かない（`note` 行も出ない。`directory` を書いたときの備え） | 同上 |
+
+- あわせて、GC ログの書き換えの対象にならない書き方として「`$JBOSS_HOME` のような変数を文字のまま含むパス」を `docs/LOG_ROTATION.md` 10-2 (4) に明記した。standalone.sh が起動時に `eval` で展開するので JVM には本物のパスが届くが、エントリポイントは判定できず、note も WARN も出ない。本番の値がこの形かどうかは未確認（14-8）。
+- 検討書 9-2 の対処の記号を A〜G からア〜キに変えた（検討書の「案 B」と、GitHub main の方式を指す「案 B」の取り違えを防ぐため）。
+
+### 14-6. 元リポジトリで行った操作
+
+| 順 | 操作 | 結果 |
+|---|---|---|
+| 1 | 状態の確認（`git status`・`git branch -avv`・`git reflog`・`git ls-remote origin`） | ローカル `main` ＝ `origin/main` ＝ GitHub の main ＝ `5f13387`。作業ツリーはクリーンで、stash も無い。9 章でステージした状態は 2026-09-27 12:59 に取り消されていた（9 章の追記） |
+| 2 | 正本を `pin_method/` へ写す（`cp -r`） | `diff -r` でバイト単位まで一致 |
+| 3 | ルートに `README.md` を新規作成 | ルートの既存ファイルは変更なし |
+| 4 | `git add README.md pin_method`、試験スクリプト 4 本は `git add --chmod=+x` | 新規 22 ファイルをステージ（`100755` は `test/local/` の 2 本と `test/rotation/` の 2 本）。ステージした 21 ファイルの中身は正本と同じ（ハッシュ一致）。`git diff HEAD -- docker docs` は空（ルートの差分なし）。**コミット・push はしていない** |
+
+### 14-7. 確認
+
+| 確認 | 結果 |
+|---|---|
+| `pin_method/` からエントリポイントの単体試験 | **PASS=333 FAIL=0 SKIP=0**（dash・bash --posix・busybox sh、26 秒） |
+| 静的検査（`pin_method/` で） | 構文（3 シェル）OK、CR 0。shellcheck の指摘 4 件（SC2012 の info 1 件・SC2010 の warning 3 件）は、すべて `5e7343c` の同じ行からある既存のもの |
+| 正本と写し | `diff -r` 一致。ステージした blob もハッシュ一致 |
+| ルートのコンテナ専用リンク方式 | 追跡ファイルの差分なし。`docker/base/tests/rotation_isolation_test.sh` は `/usr/local/bin` へ書き込む作り（コンテナの中で root で動かす前提）のため、この PC（WSL の一般ユーザー）では実行していない |
+| README の記述の裏付け | `standalone.sh` が `JBOSS_LOG_DIR` を使うのはブートログと gc.log だけ（WildFly Core 18.1.2.Final の `bin/standalone.sh` 270〜293 行・346／359 行）。`JAVA_OPTS` は起動時に `eval` される（同 346 行）。JDK 11 の `-Xloggc` の扱い（`arguments.cpp` 2838〜2841 行・3738〜3744 行）と、統合ロギングの既定値（`logFileOutput.hpp` 42〜43 行） |
+
+### 14-8. 残っている確認・判断
+
+| 項目 | 内容 |
+|---|---|
+| 本番の GC ログの指定の正確な値と設定場所 | 出力先が `standalone/log`・`mid/` の下か、`$JBOSS_HOME` のような変数を文字のまま書いていないか、どこで設定しているか（エントリポイント／タスク定義／`bin/standalone.conf`）。修正版で起動したとき、起動ログに GC ログの `note` 行が出れば書き換えが効いている |
+| コミット・push | 元リポジトリ（ステージ済み）と、このリポジトリ（未コミット）の両方。手順は 14-9 |
+| コンテナ専用リンク方式を本番で使う場合 | 本番の起動処理（`CMD=eap`）の取り込みが別に要る。front／back を作り直すまでは `LOG_LINK_STRICT=1` が安全（`pin_method/README.md` 5 章の注意、本書 9 章の参考） |
+
+### 14-9. コミット・push の手順（未実施）
+
+```bash
+# 元リポジトリ（ステージ済み）
+cd C:/Users/taka_/Claude/ECS_EFS_Dockerfile_Symboliclink_lite
+git status                      # new file: README.md、pin_method/…（22 ファイル）
+git diff --cached --stat
+git commit -m "pin 方式 (実体パスへの固定) を pin_method/ に追加。ルートのコンテナ専用リンク方式は変更なし"
+git push                        # GitHub の main に 2 つの方式が並ぶ
+
+# このリポジトリ（正本・報告書。未コミット）
+cd C:/Users/taka_/claude/JBossEAP_SLink_Current_Problem
+git add -A
+git commit -m "gc.log・access_log.log 対応、本番の確認結果の反映、pin_method/ への分離の記録"
+git push
+```
+
+- 以後、正本を直したら `pin_method/README.md` 8 章の手順で写し、`diff -r` で一致を確かめてから元リポジトリでコミットする。

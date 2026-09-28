@@ -16,6 +16,10 @@
   数分後が JVM にとっての 0 時になるようにする（時計そのものは実時刻）。
 - 検証用 JSP（`/ticker/log.jsp?who=…`）で任意の時点に `TICK who=…` を 1 行出し、
   最後に共有ボリューム上の `mid/*/server.log*` の中身と `/proc/<java>/fd` を記録する。
+- 【2026-09-28】検証用 WAR には `gc.jsp`（`?op=gc` で GC を起こす、`?op=rotate` で GC ログを今すぐ
+  ローテーションさせる）も入る。gc.log と access_log.log の試験（G1 シナリオ、access-log の有効化、
+  GC ログの明示指定、GC_LOG=true）は Docker を使わない `test/local/rotation_local.sh` にだけ入れた
+  （`test/local/README.md`・`docs/LOG_ROTATION.md` 10-2）。
 - front／back のイメージの CMD は本番と同じ `eap`（エントリポイントが `standalone.sh -b 0.0.0.0
   -bmanagement 0.0.0.0 -c "${SERVER_CONFIG}" …` で起動する）。`SERVER_CONFIG=standalone.xml` と
   `EXTRASLB_TRUSTSTORE_TYPE=JKS` は base の Dockerfile の ENV で入る。本番と同じく `JAVA_OPTS` に

@@ -23,6 +23,8 @@
 #   3-B. JBoss のログ出力先を「current 経由のパス」ではなく
 #      mid/<LOG_ID> の実体パスへ固定 (pin) する。  ★ server.log 不正ローテーション対策
 #      (-Djboss.server.log.dir / JBOSS_LOG_DIR / logging.properties の fileName)
+#      gc.log と access_log.log も同じ理由で、共有の置き場を指す明示指定を実体パスへ揃える
+#      (JAVA_OPTS 等の -Xlog / -Xloggc のパス、standalone.xml の access-log の directory)
 #   4. JBoss が起動時に書き込む standalone 配下の可変ディレクトリを
 #      「実際に書き込んでみて」検証する。
 #   5. サービスが intra-web かつフロントコンテナの場合のみ、
@@ -73,6 +75,28 @@
 #     効き始めるので、削除前に起動ログの JAVA_OPTS 行を確認すること。
 #   詳細は docs/LOG_ROTATION.md の「10-1」を参照。
 #
+# 【gc.log と access_log.log について】
+#   どちらも server.log と同じく「閉じる → パス名で rename → パス名で開き直す」で
+#   ローテーションするため、パスが current を辿ると他タスクのファイルを改名してしまう。
+#     gc.log         : JVM (HotSpot) が容量 (EAP の既定 3MB) ごとに行う。rename の前に
+#                      パス名で gc.log.N を削除するため、他タスクの GC ログが消えることもある。
+#                      JBoss EAP は standalone.conf の既定で GC_LOG=true (gc.log を出す)。
+#     access_log.log : Undertow が日付変更後の最初のリクエストで行う。ファイルは最初の
+#                      リクエストで初めて開く (遅延 open) ので、起動直後に別タスクが
+#                      current を張り替えると、日付に関係なく他タスクのファイルに書き始める。
+#   既定の書き方なら pin だけで自分のディレクトリに出る (gc.log は standalone.sh が
+#   $JBOSS_LOG_DIR/gc.log を使い、access-log の directory の既定は ${jboss.server.log.dir})。
+#   ただし次の明示指定は pin を素通りするため、3-B で実体パスへ書き換える。
+#     - JAVA_OPTS (と JAVA_TOOL_OPTIONS / JDK_JAVA_OPTIONS) の -Xlog:…file=<パス> / -Xloggc:<パス>
+#       が共有の置き場を指すもの。standalone.sh は JAVA_OPTS に GC ログの指定があると自分の指定を
+#       足さずにそのまま使い、JVM のオプションは起動引数では上書きできないため、パス部分だけを
+#       書き換える (JAVA_OPTS の他の部分は 1 文字も変えない)
+#     - standalone.xml の access-log で、directory が /opt/jboss-eap/standalone/log などの
+#       絶対パスや ${jboss.server.base.dir}/log、relative-to="jboss.server.base.dir" のもの。
+#       directory="${jboss.server.log.dir}<その下>" に書き換える (relative-to は外す)
+#   イメージの standalone.conf にある GC ログの指定は書き換えられない (WARN のみ)。
+#   詳細は docs/LOG_ROTATION.md の「10-2」を参照。
+#
 # 一意ディレクトリ名の方針 (LOG_ID_SOURCE で切り替え):
 #   random (既定) : ECS メタデータエンドポイントに依存せず、コンテナ起動時に自前で
 #                   「起動時刻(YYYYMMDDhhmmss) + '-' + ランダム英数字 8 桁」を生成する。
@@ -119,7 +143,8 @@
 #   JBOSS_LOG_PIN     : on (既定) | off
 #                       on  = JBoss の書き込み先を mid/<LOG_ID> の実体パスへ固定する
 #                             (CMD が eap / standalone.sh なら -Djboss.server.log.dir を
-#                              自動付与。共有の置き場を指す明示指定はこれで上書きする)
+#                              自動付与。共有の置き場を指す明示指定はこれで上書きする。
+#                              gc.log・access_log.log の共有の置き場を指す指定も揃える)
 #                       off = 従来どおり current 経由で書く。複数タスクが並走すると
 #                             日付変更時のローテーションが他タスクのログを壊す。
 #                             切り分け・再現試験以外では使わないこと
@@ -277,25 +302,63 @@ fetch_task_id() {
     return 1
 }
 
+# --- 共有の置き場かどうか (-Djboss.server.log.dir・gc.log・access_log.log で共通) ---
+# 共有の置き場 = そこへ書くと、全タスクで 1 本の current を辿る (または他タスクの
+# ディレクトリに当たる) 場所:
+#   - イメージに焼いた ${JBOSS_HOME}/standalone/log (→ mid/current) とその下
+#   - mid/ とその下 (mid/current、他タスクや前回起動の mid/<ID>)
+# ディレクトリ $1 がそこにあれば 0 を返し、standalone/log や mid/<何か> より下の残り
+# ("" または "/サブ/…") を SHARED_REST に入れる。書き換えるときは ${LOG_OWN}${SHARED_REST}
+# (自分の実体パス) にする。実在するディレクトリは物理パスでも調べる (別の綴りや、
+# EFS 側がシンボリックリンク経由のとき)。
+# MID_REAL (mid の実体パス。3-B で求める) を使うので、3-B より後で呼ぶこと。
+under_mid() {   # under_mid <パス> <mid の場所>
+    case "$1" in
+        "$2") return 0 ;;
+        "$2/"*)
+            _mr="${1#"$2/"}"
+            case "${_mr}" in */*) SHARED_REST="/${_mr#*/}" ;; esac
+            return 0
+            ;;
+    esac
+    return 1
+}
+shared_log_rest() {   # shared_log_rest <ディレクトリ>
+    SHARED_REST=""
+    _sd="$1"
+    while :; do case "${_sd}" in ?*/) _sd="${_sd%/}" ;; *) break ;; esac; done
+    case "${_sd}" in
+        "${STANDALONE_DIR}/log")   return 0 ;;
+        "${STANDALONE_DIR}/log/"*) SHARED_REST="/${_sd#"${STANDALONE_DIR}/log/"}"; return 0 ;;
+    esac
+    under_mid "${_sd}" "${MID_DIR}" && return 0
+    _sp="$(cd "${_sd}" 2>/dev/null && pwd -P)" || return 1
+    under_mid "${_sp}" "${MID_REAL}"
+}
+
+# 全タスクが同じファイルを使う EFS 上の場所 (EFS_LOG_DIR とその下。/webapp/…/logs のリンク先)
+# なら 0。mid/ の下は shared_log_rest で先に判定すること。EFS_REAL は 3-B で求める。
+on_shared_efs() {   # on_shared_efs <ディレクトリ>
+    _ep="$(cd "$1" 2>/dev/null && pwd -P)" || _ep=""
+    for _eq in "$1" "${_ep}"; do
+        case "${_eq}" in
+            "${EFS_LOG_DIR}"|"${EFS_LOG_DIR}/"*|"${EFS_REAL}"|"${EFS_REAL}/"*) return 0 ;;
+        esac
+    done
+    return 1
+}
+
 # --- -Djboss.server.log.dir の明示指定の扱い ---------------------------------
 # 起動引数 (CMD=eap のときは JBOSS_SERVER_OPTS) と JAVA_OPTS にある指定を 1 つずつ調べる。
 #   - 共有の置き場を指す値は pin で上書きする。イメージに焼いた ${JBOSS_HOME}/standalone/log
-#     (→ mid/current) と、実体が mid/ 配下になる値 (current 経由・他タスクのディレクトリ)。
+#     (→ mid/current) と、mid/ 配下になる値 (current 経由・他タスクのディレクトリ)。
 #     これを JBoss が使うと、日付変更時の rename / 再 open が他タスクのファイルに当たる。
 #     本番の JAVA_OPTS にある -Djboss.server.log.dir=${JBOSS_HOME}/standalone/log がこれ。
 #   - それ以外の値は、運用者が意図して別の場所へ出していると見なし、pin しない。
 # 値は standalone.sh と同じく引用符を外してから判定する。
 # MID_REAL (mid の実体パス。3-B で求める) を使うので、3-B より後で呼ぶこと。
 is_shared_log_dir() {
-    _v="$(printf '%s' "$1" | tr -d "'\"")"
-    case "${_v}" in
-        "${STANDALONE_DIR}/log"|"${STANDALONE_DIR}/log/"*) return 0 ;;
-    esac
-    _p="$(cd "${_v}" 2>/dev/null && pwd -P)" || return 1
-    case "${_p}/" in
-        "${MID_REAL}/"*) return 0 ;;
-    esac
-    return 1
+    shared_log_rest "$(printf '%s' "$1" | tr -d "'\"")"
 }
 
 # 1 つの引数を判定し、上書きする指定は SHARED_LOG_DIRS に出どころ付きで足し、
@@ -393,6 +456,178 @@ pin_logging_properties() {
     else
         echo "[efs-entrypoint] WARN: ${_lp} を書き換えられません。起動直後の数行が current 経由で書かれる可能性があります" >&2
     fi
+}
+
+# --- gc.log (JVM の GC ログ) の出力先を実体パスへ揃える (3-B で使用) ----------
+# standalone.sh は GC_LOG=true (JBoss EAP の standalone.conf の既定) のとき
+#   -Xlog:gc*:file="$JBOSS_LOG_DIR/gc.log":time,uptimemillis:filecount=5,filesize=3M
+# (JDK 8 は -Xloggc:"$JBOSS_LOG_DIR/gc.log" …) を JVM に渡す。JBOSS_LOG_DIR は 3-B で実体パスに
+# するので、この既定の gc.log は何もしなくても自分のディレクトリに出る。
+# ところが JAVA_OPTS に GC ログの指定 (-Xlog:gc… / -Xloggc:…) が既にあると、standalone.sh は
+# 自分の指定を足さずにそれをそのまま JVM に渡す。そのパスが共有の置き場を指していると、
+# JVM が容量 (filesize) ごとに行うローテーション
+#   閉じる → パス名で gc.log.N を削除 → パス名で gc.log を gc.log.N へ rename → パス名で開き直す
+# が current を辿り、他タスクの現役 gc.log を改名し、他タスクの gc.log.N を削除する。
+# JVM のオプションは standalone.sh の起動引数では上書きできないため、該当する指定の
+# パス部分だけを ${LOG_OWN}<共有の置き場より下の残り> に書き換える (他の部分は 1 文字も変えない)。
+# 値は空白で区切った字句ごとに調べる (引用符は外して判定し、書き換えは元の字句の中で行う)。
+#   -Xlog:<対象>:[file=]<パス>[:<装飾>[:<オプション>]]   -Xloggc:<パス>
+# 相対パス・stdout / stderr・mid/ の外は書き換えない (EFS 上で全タスクが共有する場所なら WARN)。
+pin_gc_log_var() {   # pin_gc_log_var <変数名>
+    eval "_gv=\${$1:-}"
+    [ -n "${_gv}" ] || return 0
+    _gnew="${_gv}"
+    set -f
+    for _gt in ${_gv}; do
+        _gu="$(printf '%s' "${_gt}" | tr -d "'\"")"
+        case "${_gu}" in
+            -Xloggc:*) _gf="${_gu#-Xloggc:}" ;;
+            -Xlog:*:*) _gf="${_gu#-Xlog:*:}"; _gf="${_gf%%:*}"; _gf="${_gf#file=}" ;;
+            *) continue ;;
+        esac
+        case "${_gf}" in /?*/?*) ;; *) continue ;; esac
+        _gd="${_gf%/*}"; _gb="${_gf##*/}"
+        if ! shared_log_rest "${_gd}"; then
+            if on_shared_efs "${_gd}"; then
+                echo "[efs-entrypoint] WARN: $1 の GC ログの出力先 ${_gf} は全タスクで共有する EFS 上の場所です。複数の JVM が同じ gc.log を改名・削除し合うため、\$JBOSS_LOG_DIR の下にしてください (docs/LOG_ROTATION.md 10-2)。" >&2
+            fi
+            continue
+        fi
+        case "${_gt}" in
+            *"${_gf}"*) ;;
+            *) echo "[efs-entrypoint] WARN: $1 の GC ログの指定を書き換えられません (パスの途中に引用符があります): ${_gt}" >&2
+               continue ;;
+        esac
+        # 字句の中のパスだけを置き換え、値全体の中の同じ字句 (最初の 1 つ) を差し替える
+        _gtn="${_gt%%"${_gf}"*}${LOG_OWN}${SHARED_REST}/${_gb}${_gt#*"${_gf}"}"
+        _gnew="${_gnew%%"${_gt}"*}${_gtn}${_gnew#*"${_gt}"}"
+        mkdir -p "${LOG_OWN}${SHARED_REST}" 2>/dev/null || true
+        GC_PINNED="${GC_PINNED:+${GC_PINNED}, }$1: ${_gf}"
+    done
+    set +f
+    if [ "${_gnew}" != "${_gv}" ]; then
+        eval "$1=\${_gnew}"
+        # shellcheck disable=SC2163  # $1 は変数名 (その名前の変数を export する)
+        export "$1"
+    fi
+}
+
+# イメージの standalone.conf (standalone.sh が読み込む) にある GC ログの指定は、読み取り専用の
+# ルート FS 上にあるためエントリポイントからは書き換えられない。共有の置き場を指していそうな
+# 行があれば、イメージ側で直すよう WARN だけ出す ($JBOSS_LOG_DIR を使う書き方なら pin に乗る)。
+warn_gc_conf() {
+    _gcf="${RUN_CONF:-${JBOSS_HOME}/bin/standalone.conf}"
+    [ -r "${_gcf}" ] || return 0
+    _gcl="$(grep -n -e '-Xlog' "${_gcf}" 2>/dev/null | grep -v -e '^[0-9]*:[[:space:]]*#' \
+            | grep -e 'standalone/log' -e '/mid/' | head -n 3 | tr '\n' ' ' || true)"
+    [ -n "${_gcl}" ] || return 0
+    echo "[efs-entrypoint] WARN: ${_gcf} に共有の置き場 (standalone/log・mid/) を指していそうな GC ログの指定があります: ${_gcl}" >&2
+    echo "[efs-entrypoint] WARN: この指定はエントリポイントから書き換えられません。容量でのローテーションが他タスクの gc.log を改名・削除し得るので、イメージの standalone.conf を \$JBOSS_LOG_DIR/gc.log を使う書き方に直してください (docs/LOG_ROTATION.md 10-2)。" >&2
+}
+
+pin_gc_logs() {
+    GC_PINNED=""
+    for _gvar in JAVA_OPTS JAVA_TOOL_OPTIONS JDK_JAVA_OPTIONS; do
+        pin_gc_log_var "${_gvar}"
+    done
+    if [ -n "${GC_PINNED}" ]; then
+        say "note: 共有の置き場を指す GC ログの指定 (${GC_PINNED}) を ${LOG_OWN} へ書き換えました (docs/LOG_ROTATION.md 10-2)"
+    fi
+    warn_gc_conf
+}
+
+# --- access_log.log (Undertow のアクセスログ) の出力先を実体パスへ揃える (3-B で使用) ---
+# standalone.xml の <access-log/> の directory の既定は ${jboss.server.log.dir} なので、
+# 既定の書き方なら 3-B の pin (-Djboss.server.log.dir=<実体パス>) で自分のディレクトリに出る。
+# ところが directory を /opt/jboss-eap/standalone/log のような絶対パス、
+# ${jboss.server.base.dir}/log・${jboss.home.dir}/standalone/log、あるいは
+# relative-to="jboss.server.base.dir" + directory="log" で書くと pin を素通りする。
+# Undertow (DefaultAccessLogReceiver) は日付変更後の最初のリクエストで
+#   閉じる → パス名で access_log.log を access_log.<日付>.log へ rename → パス名で開き直す
+# を行い、ファイルは最初のリクエストで初めて開く (遅延 open) ため、パスが current を辿ると
+# 他タスクのディレクトリで改名・作成・追記してしまう。
+# そこで共有の置き場を指す access-log は directory="${jboss.server.log.dir}<その下の残り>" に
+# 書き換えて (relative-to は外す) pin に乗せる。判定できない式 (${env.X} など)、全タスクで
+# 共有する EFS 上の場所 (mid/ の外)、属性が複数行にわたる要素は WARN だけ出す。
+# 対象は起動する設定ファイル ${CONF_DIR}/${JBOSS_CONFIG_FILE} (seed から毎起動復元されたもの)。
+# shellcheck disable=SC2016  # ${jboss.server.log.dir} は JBoss が解決する式 (シェルでは展開しない)
+LOGDIR_EXPR='${jboss.server.log.dir}'
+
+# 要素の属性の並び $1 から、属性 $2 の値を取り出す ("…" と '…' の両方。無ければ空)
+xml_attr() {
+    printf '%s' "$1" | sed -n -e "s/.*[[:space:]]$2=\"\([^\"]*\)\".*/\1/p" -e 't' \
+                              -e "s/.*[[:space:]]$2='\([^']*\)'.*/\1/p" | head -n 1
+}
+
+pin_access_log_line() {   # pin_access_log_line <行番号> <行の内容>
+    _an="$1"
+    _ae="${2#*<access-log}"
+    case "${_ae}" in
+        *'>'*) _ae="${_ae%%>*}" ;;
+        *) echo "[efs-entrypoint] WARN: ${_ax} ${_an} 行目の access-log は属性が複数行にわたるため、出力先を確認できません。directory が共有の置き場 (standalone/log・mid/) を指していないか確認してください (docs/LOG_ROTATION.md 10-2)。" >&2
+           return 0 ;;
+    esac
+    [ "$(xml_attr "${_ae}" use-server-log)" = "true" ] && return 0   # server.log に書く設定
+    _adir="$(xml_attr "${_ae}" directory)"
+    _arel="$(xml_attr "${_ae}" relative-to)"
+    case "${_arel}" in
+        "")                    _aeff="${_adir:-${LOGDIR_EXPR}}" ;;
+        jboss.server.log.dir)  return 0 ;;                          # pin 済み
+        jboss.server.base.dir) _aeff="${STANDALONE_DIR}/${_adir}" ;;
+        jboss.home.dir)        _aeff="${JBOSS_HOME}/${_adir}" ;;
+        *)                     return 0 ;;   # その他 (jboss.server.data.dir など) はタスクごとの場所
+    esac
+    if [ -n "${_arel}" ] && [ -z "${_adir}" ]; then
+        echo "[efs-entrypoint] WARN: ${_ax} ${_an} 行目の access-log は relative-to=${_arel} だけで directory が無いため、出力先を確認できません (docs/LOG_ROTATION.md 10-2)。" >&2
+        return 0
+    fi
+    # JBoss の式のうち、よく使うものだけ展開して判定する
+    # shellcheck disable=SC2016  # '${…}' は JBoss の式そのもの (シェルでは展開しない)
+    case "${_aeff}" in
+        "${LOGDIR_EXPR}"|"${LOGDIR_EXPR}/"*) return 0 ;;            # pin 済み (既定を含む)
+        '${jboss.server.base.dir}'*) _aeff="${STANDALONE_DIR}${_aeff#'${jboss.server.base.dir}'}" ;;
+        '${jboss.home.dir}'*)        _aeff="${JBOSS_HOME}${_aeff#'${jboss.home.dir}'}" ;;
+    esac
+    # shellcheck disable=SC2016
+    case "${_aeff}" in
+        *'${'*)
+            echo "[efs-entrypoint] WARN: ${_ax} ${_an} 行目の access-log の出力先 ${_aeff} は式を含むため確認できません。共有の置き場 (standalone/log・mid/) や全タスク共有の EFS を指していないか確認してください (docs/LOG_ROTATION.md 10-2)。" >&2
+            return 0 ;;
+        /*) ;;
+        *) return 0 ;;
+    esac
+    if shared_log_rest "${_aeff}"; then
+        _anew="${LOGDIR_EXPR}${SHARED_REST}"
+        case "${_ax}${_adir}${_arel}" in
+            *'#'*) echo "[efs-entrypoint] WARN: パスに '#' を含むため ${_ax} ${_an} 行目の access-log を書き換えられません (出力先: ${_aeff})" >&2
+                   return 0 ;;
+        esac
+        if sed -i -e "${_an}s#\(<access-log[^>]*[[:space:]]directory=\)[\"']$(re_quote "${_adir}")[\"']#\1\"$(repl_quote "${_anew}")\"#" "${_ax}" 2>/dev/null \
+           && { [ -z "${_arel}" ] \
+                || sed -i -e "${_an}s#\(<access-log[^>]*\)[[:space:]]relative-to=[\"']$(re_quote "${_arel}")[\"']#\1#" "${_ax}" 2>/dev/null; } \
+           && sed -n "${_an}p" "${_ax}" | grep -qF "directory=\"${_anew}\""; then
+            say "note: access-log (${JBOSS_CONFIG_FILE} ${_an} 行目) の出力先 ${_arel:+relative-to=${_arel} }directory=${_adir} は共有の置き場を指すため、directory=${_anew} (= ${LOG_OWN}${SHARED_REST}) に書き換えました (docs/LOG_ROTATION.md 10-2)"
+        else
+            echo "[efs-entrypoint] WARN: ${_ax} ${_an} 行目の access-log を書き換えられません。access_log.log が current 経由で書かれ、日付変更時に他タスクのファイルを改名し得ます (出力先: ${_aeff})" >&2
+        fi
+        return 0
+    fi
+    if on_shared_efs "${_aeff}"; then
+        echo "[efs-entrypoint] WARN: ${_ax} ${_an} 行目の access-log の出力先 ${_aeff} は全タスクで共有する EFS 上の場所です。複数のタスクが同じ access_log.log に書き、日付変更時に互いに改名し合うため、directory を指定しない (既定 ${LOGDIR_EXPR}) か ${LOGDIR_EXPR} の下にしてください (docs/LOG_ROTATION.md 10-2)。" >&2
+    fi
+    return 0
+}
+
+pin_access_log() {
+    _ax="${CONF_DIR}/${JBOSS_CONFIG_FILE}"
+    [ -f "${_ax}" ] || return 0
+    _al="$(grep -n '<access-log[[:space:]/>]' "${_ax}" 2>/dev/null || true)"
+    [ -n "${_al}" ] || return 0
+    # ヒアドキュメントは使わない (bash は一時ファイルを作るため、読み取り専用のルート FS では失敗する)。
+    # パイプの右側はサブシェルなので、ここで決めた変数は外へ持ち出さない (書き換えと出力だけ行う)。
+    printf '%s\n' "${_al}" | while IFS= read -r _aline; do
+        pin_access_log_line "${_aline%%:*}" "${_aline#*:}"
+    done || true
 }
 
 # =============================================================================
@@ -624,9 +859,11 @@ say "JBoss EAP log dir: ${MID_DIR}/${LOG_ID} (LOG_ID_SOURCE=${LOG_ID_SOURCE})"
 # ディレクトリを掴む競合がある。
 LOG_OWN="$(cd "${MID_DIR}/${LOG_ID}" 2>/dev/null && pwd -P)" \
     || die "${MID_DIR}/${LOG_ID} を解決できません。"
-# 明示指定が共有の置き場を指すかの判定 (is_shared_log_dir) に使う
+# 明示指定が共有の置き場を指すかの判定 (shared_log_rest / on_shared_efs) に使う
 MID_REAL="$(cd "${MID_DIR}" 2>/dev/null && pwd -P)" \
     || die "${MID_DIR} を解決できません。"
+EFS_REAL="$(cd "${EFS_LOG_DIR}" 2>/dev/null && pwd -P)" \
+    || die "${EFS_LOG_DIR} を解決できません。"
 
 # PIN_OPT: 6 章で standalone.sh の直後に付ける引数 (空なら付けない)
 PIN_OPT=""
@@ -638,7 +875,7 @@ case "${JBOSS_LOG_PIN}" in
             echo "[efs-entrypoint] WARN: その場所を複数のタスクで共有していると、日付変更時のローテーションが他タスクのログを壊します。" >&2
         else
             # standalone.sh はこの変数から -Dorg.jboss.boot.log.file (logging サブシステム
-            # 起動前のブートログ) と GC ログ (GC_LOG=true 時) の出力先を決める。
+            # 起動前のブートログ) と GC ログ (GC_LOG=true 時。JBoss EAP の既定) の出力先を決める。
             export JBOSS_LOG_DIR="${LOG_OWN}"
             pin_logging_properties
             case "${1:-}" in
@@ -656,6 +893,10 @@ case "${JBOSS_LOG_PIN}" in
                     echo "[efs-entrypoint] WARN: ラッパーから JBoss へ -Djboss.server.log.dir=\"\${JBOSS_LOG_DIR}\" を渡してください (JBOSS_LOG_DIR=${LOG_OWN})。" >&2
                     ;;
             esac
+            # gc.log (JVM) と access_log.log (Undertow) も同じ理由で、共有の置き場を指す
+            # 明示指定を実体パスへ揃える (既定の書き方なら上の pin だけで自分のディレクトリに出る)
+            pin_gc_logs
+            pin_access_log
         fi
         ;;
     off)

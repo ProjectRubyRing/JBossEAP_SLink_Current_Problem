@@ -1,5 +1,7 @@
 # ECS + EFS シンボリックリンク設計解説
 
+> **この文書は pin 方式のものです（2026-09-29 追記）:** GitHub `ProjectRubyRing/ECS_EFS_Dockerfile_Symboliclink_lite` では、この一式は `pin_method/` フォルダにあります。同リポジトリのルートにある同じ名前の文書は、**別の方式（コンテナ専用リンク方式）**の説明です。2 つの違いと、混ぜてはいけない組み合わせは [`../README.md`](../README.md) を参照してください。
+
 対象: ECS クラスタ上の 4 サービス (`interapi` / `intra-api` / `intra-web(intraweb)` / `sfapi`)。
 各タスクはフロントコンテナ・バックコンテナ・サイドカーコンテナで構成され、
 フロント/バックは EFS を `/mnt/logs` (アプリログ・ミドルウェアログ) と
@@ -53,6 +55,7 @@
     standalone.sh -Djboss.server.log.dir=/mnt/logs/<C>/logs/<S>/mid/<自分の LOG_ID>
     JBOSS_LOG_DIR=/mnt/logs/<C>/logs/<S>/mid/<自分の LOG_ID>
     → server.log の作成・日次ローテーション (rename / 再 open) は常に自分のディレクトリ内
+      gc.log (GC_LOG=true = EAP の既定) と access_log.log (access-log を有効にした場合) も同じ
 ```
 
 > `LOG_ID` の例: `20260722103045-x7sk1z0e`
@@ -135,6 +138,18 @@ rename と再 open の瞬間だけ `current` を辿り直すため、`current` �
   エントリポイントが `JAVA_OPTS` に入れていた `-Djboss.server.log.dir=${JBOSS_HOME}/standalone/log`
   がこれに当たる (JBoss の既定値と同じで current を経由する。削除を推奨。
   [`LOG_ROTATION.md`](./LOG_ROTATION.md) 10-1)。`mid/` の外を指す明示指定は運用者の意図として尊重する
+- `gc.log` と `access_log.log` も同じ仕組み (閉じる → パス名で rename → パス名で開き直す) で
+  ローテーションするので、書き込み経路から current を外す。既定の書き方なら上の pin で済む
+  (gc.log は standalone.sh が `$JBOSS_LOG_DIR/gc.log` を使い、access-log の directory の既定は
+  `${jboss.server.log.dir}`)。pin を素通りする明示の書き方は、エントリポイントが実体パスへ揃える
+  ([`LOG_ROTATION.md`](./LOG_ROTATION.md) 10-2):
+  - `JAVA_OPTS` (と `JAVA_TOOL_OPTIONS`・`JDK_JAVA_OPTIONS`) の `-Xlog:…file=<パス>`・`-Xloggc:<パス>` が
+    共有の置き場を指すもの → パス部分だけを `mid/<自分の LOG_ID>` へ書き換える (JVM のオプションは
+    起動引数で上書きできないため。`JAVA_OPTS` の他の部分は変えない)
+  - `standalone.xml` の `<access-log>` の `directory` が `/opt/jboss-eap/standalone/log` などの絶対パスや
+    `${jboss.server.base.dir}/log`、`relative-to="jboss.server.base.dir"` のもの →
+    `directory="${jboss.server.log.dir}…"` に書き換える (seed から復元した作業用のコピーだけ)
+  - イメージの `standalone.conf` の GC ログの指定は書き換えられないので WARN を出す
 
 `current` と `standalone/log` のリンクは、運用者やログ収集の入口
 (「最後に起動したタスク」の目印) として従来どおり張り替える。

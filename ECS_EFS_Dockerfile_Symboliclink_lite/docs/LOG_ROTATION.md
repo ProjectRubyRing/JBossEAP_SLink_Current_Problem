@@ -1,5 +1,7 @@
 # JBoss EAP server.log が日付変更後も前日付ファイルに追記される問題 — current リンクとログローテーションの動作原理・実機検証・対処
 
+> **この文書は pin 方式のものです（2026-09-29 追記）:** GitHub `ProjectRubyRing/ECS_EFS_Dockerfile_Symboliclink_lite` では、この一式は `pin_method/` フォルダにあります。同リポジトリのルートにある同じ名前の文書は、**別の方式（コンテナ専用リンク方式）**の説明です。2 つの違いと、混ぜてはいけない組み合わせは [`../README.md`](../README.md) を参照してください。
+
 | 項目 | 内容 |
 |---|---|
 | 対象リポジトリ | ProjectRubyRing/ECS_EFS_Dockerfile_Symboliclink_lite（ECS + EFS + readonlyRootFilesystem=true、2 段シンボリックリンク方式） |
@@ -44,6 +46,8 @@
 | **修正の効果（実機）** | 同じ 0 時シナリオで、各タスクが自分のディレクトリ内だけで server.log → server.log.\<前日\> を正しく作り、他タスクのファイルに一切触れないことを確認した。 |
 
 > **移行時の注意:** 修正前のイメージで動いているタスクは、修正後もしばらく current 経由で rename します。切り替えのデプロイは日中に行い、0 時（JVM のタイムゾーン）までに修正前のタスクがすべて停止したことを確認してください。
+
+> **gc.log と access_log.log（2026-09-28 追記・2026-09-29 更新）:** どちらも「閉じる → パス名で rename → パス名で開き直す」でローテーションするため、server.log と同じ事故が起きます。本番の現状（pin なし）では access_log.log に同じ症状が出ます。gc.log も、本番の JAVA_OPTS には -Xlog／-Xloggc の明示がある（2026-09-29 確認）ので、出力先が standalone/log（リンク）の下なら容量ローテーションのたびに起き得ます（明示が無ければ、standalone.sh が JAVA_OPTS の -Djboss.server.log.dir を実体に解決するので偶然起きない）。既定の書き方なら pin で直り、pin を素通りする明示の書き方（JAVA_OPTS の -Xlog、standalone.xml の access-log の directory）はエントリポイントが実体パスへ揃えます。本番の access-log は directory の指定が無い（既定）ので pin だけで直り、本番の gc.log はこの揃える処理で直ります。詳細は 10-2。
 
 ---
 
@@ -179,7 +183,7 @@ private void rollOver() {
 - 既定では JBOSS_LOG_DIR=$JBOSS_BASE_DIR/log（＝/opt/jboss-eap/standalone/log。リンクのまま）とし、-Dorg.jboss.boot.log.file=$JBOSS_LOG_DIR/server.log を JVM に渡す。
 - -Djboss.server.log.dir=\<dir\> を引数か JAVA_OPTS で渡すと、standalone.sh は JBOSS_LOG_DIR=$(readlink -m \<dir\>)（リンクを解決した実体パス）にする（ブートログと gc.log の出力先）。一方、JBoss 本体の jboss.server.log.dir（FILE ハンドラの relative-to）には、渡した \<dir\> が**リンクを解決しないまま**入る（ServerEnvironment は new File(値) をそのまま使う）。\<dir\> が current を経由するパスなら、実体パスへの固定にはならない。【2026-09-27 訂正。旧版は「JBoss 本体もこの値（解決後）になる」と書いていた。10-1 参照】
 - JAVA_OPTS と起動引数の両方にあるときは、standalone.sh は「JAVA_OPTS → 起動引数」の順に読んで最後の値を JBOSS_LOG_DIR にし、JBoss 本体（org.jboss.as.server.Main）も起動引数の -D でシステムプロパティを上書きする。つまり**起動引数の値が勝つ**（WildFly Core 15.0.1〔EAP 7.4 系〕・18.1.2〔WildFly 26〕・main の standalone.sh と Main.java で確認）。
-- JBOSS_LOG_DIR が環境変数で設定済みならそれを使う（未設定のときだけ既定値）。GC_LOG=true のときの gc.log も $JBOSS_LOG_DIR。
+- JBOSS_LOG_DIR が環境変数で設定済みならそれを使う（未設定のときだけ既定値）。GC_LOG=true のときの gc.log も $JBOSS_LOG_DIR（JBoss EAP は standalone.conf の既定で GC_LOG=true。JAVA_OPTS に -Xlog:gc／-Xloggc があれば standalone.sh は自分の指定を足さない。10-2）。
 - JVM が exit code 10（:shutdown(restart=true)）で終わると、standalone.sh は同じ変数のまま java を起動し直す（エントリポイントは再実行されない）。
 - LAUNCH_JBOSS_IN_BACKGROUND=true のときだけ standalone.sh は SIGTERM を JVM に中継する（未設定だと PID 1 の sh が SIGTERM を受け取っても JVM に届かず、stopTimeout 後に SIGKILL になる）。
 
@@ -655,7 +659,7 @@ current -> 20260927000054-hj3kahao
 
 | 案 | 内容 | 効果 | タスク定義の変更 | 評価 |
 |---|---|---|---|---|
-| **A. 実体パスへの固定（pin）【採用・実装済み】** | エントリポイントが -Djboss.server.log.dir=mid/\<LOG_ID\> を standalone.sh に付け、JBOSS_LOG_DIR も同じ値にする。logging.properties に残った current 経由・前回 LOG_ID のパスも揃える | rename／再 open が常に自分のディレクトリで行われる。server.log・audit.log・（GC_LOG=true 時）gc.log・relative-to=jboss.server.log.dir のハンドラすべてに効く。JVM 再起動（exit 10）でも自分のディレクトリに戻る | 不要 | ◎ 根本対策 |
+| **A. 実体パスへの固定（pin）【採用・実装済み】** | エントリポイントが -Djboss.server.log.dir=mid/\<LOG_ID\> を standalone.sh に付け、JBOSS_LOG_DIR も同じ値にする。logging.properties に残った current 経由・前回 LOG_ID のパスも揃える | rename／再 open が常に自分のディレクトリで行われる。server.log・audit.log・（GC_LOG=true 時）gc.log・access_log.log（access-log の directory の既定 ${jboss.server.log.dir}）・relative-to=jboss.server.log.dir のハンドラすべてに効く（pin を素通りする明示の書き方は 10-2 で揃える）。JVM 再起動（exit 10）でも自分のディレクトリに戻る | 不要 | ◎ 根本対策 |
 | **B. コンテナ専用リンク（3 段リンク）** | standalone/log → タスクローカルの書き込み可能ボリューム上のリンク → mid/\<LOG_ID\>。リンクがコンテナごとに独立する | A と同等。/opt/jboss-eap/standalone/log を ECS Exec で覗いたときに自分のログが見える | 必要（ボリューム追加） | ○ 代替案 |
 | **C. 標準出力（JSON）＋ awslogs／FireLens** | server.log をやめ、CONSOLE ハンドラ（json-formatter）から CloudWatch Logs や S3 へ送る | ファイルのローテーション自体が無くなる。タスク単位の検索・保管は CloudWatch 側で行う（12-Factor の考え方） | 必要（ログ設定） | ○ 中長期の推奨 |
 | **D. JBoss のローテーションを止める（file-handler）** | periodic-rotating をやめ、起動ごとのディレクトリを保管単位にする | rename は無くなるが、起動時の 1 回の open が current 経由だと並行起動の競合が残る。A と併用が前提 | 不要 | △ 単独では不十分 |
@@ -739,12 +743,13 @@ aws elbv2 modify-target-group-attributes --target-group-arn <tg-arn> \
 
 | ファイル | 変更内容 |
 |---|---|
-| **docker/base/entrypoint.sh** | ①「3-B. JBoss のログ出力先を実体パスへ固定（pin）」を追加: 自分のディレクトリを current を経由せず解決し、JBOSS_LOG_DIR を export、CMD が eap（本番の起動方式）か standalone.sh なら -Djboss.server.log.dir=\<実体パス\> を standalone.sh のコマンド直後に付ける、logging.properties に残った current 経由・前回 LOG_ID のパスを揃える。共有の置き場（standalone/log・mid/ 配下）を指す明示指定は pin で上書きする。②LOG_ID_SOURCE（random／taskid）を追加し、旧タスク ID 方式を統合（メタデータ v4 から TaskARN を取得・3 回まで再試行・英数字とハイフン以外は拒否・取得できなければ random にフォールバック）。③事前検証を「自分の実体ディレクトリに書けるか」に変更し、standalone/log が別タスクを指していても異常扱いしない（並行起動では正常）。④【2026-09-27 追記】最後に本番と同じ分岐（CMD が eap なら standalone.sh -b 0.0.0.0 -bmanagement 0.0.0.0 -c "${SERVER_CONFIG}" … ${JBOSS_SERVER_OPTS}、それ以外は exec "$@"）を置いた（10-1）。 |
+| **docker/base/entrypoint.sh** | ①「3-B. JBoss のログ出力先を実体パスへ固定（pin）」を追加: 自分のディレクトリを current を経由せず解決し、JBOSS_LOG_DIR を export、CMD が eap（本番の起動方式）か standalone.sh なら -Djboss.server.log.dir=\<実体パス\> を standalone.sh のコマンド直後に付ける、logging.properties に残った current 経由・前回 LOG_ID のパスを揃える。共有の置き場（standalone/log・mid/ 配下）を指す明示指定は pin で上書きする。②LOG_ID_SOURCE（random／taskid）を追加し、旧タスク ID 方式を統合（メタデータ v4 から TaskARN を取得・3 回まで再試行・英数字とハイフン以外は拒否・取得できなければ random にフォールバック）。③事前検証を「自分の実体ディレクトリに書けるか」に変更し、standalone/log が別タスクを指していても異常扱いしない（並行起動では正常）。④【2026-09-27 追記】最後に本番と同じ分岐（CMD が eap なら standalone.sh -b 0.0.0.0 -bmanagement 0.0.0.0 -c "${SERVER_CONFIG}" … ${JBOSS_SERVER_OPTS}、それ以外は exec "$@"）を置いた（10-1）。⑤【2026-09-28 追記】gc.log と access_log.log について、共有の置き場を指す明示指定（JAVA_OPTS・JAVA_TOOL_OPTIONS・JDK_JAVA_OPTIONS の -Xlog／-Xloggc のパス、standalone.xml の access-log の directory／relative-to）を実体パス・${jboss.server.log.dir} へ揃える。-Djboss.server.log.dir の判定も同じ関数（shared_log_rest）にまとめた（10-2）。 |
 | **docker/base/entrypoint.taskid.sh** | 別実装をやめ、LOG_ID_SOURCE=taskid を既定にして efs-entrypoint.sh を呼ぶ互換ラッパーにした（設定復元・fail-fast・pin の移植漏れを構造的に無くす）。自分自身を呼ぶ誤設定は FATAL で停止 |
 | **docker/base/Dockerfile** | efs-entrypoint.sh と efs-entrypoint-taskid.sh の両方をイメージに入れる（CRLF 除去も両方） |
 | **docker/front/Dockerfile、docker/back/Dockerfile** | コメントを実態に合わせた（リンクは入口として残し、JBoss は実体パスへ書く）。リンクの作り方は変更なし |
 | **docs/LOG_ROTATION.md（新規）** | 本書（Markdown 版） |
-| **test/rotation/（新規・検証専用）** | 7 章の再現・回帰試験スクリプト（WildFly を使った疑似 EAP、S1／S2／S2r ほか）。JBOSS_LOG_PIN=on／off で修正後と旧挙動を比べられる。本番イメージには含めない |
+| **test/rotation/（新規・検証専用）** | 7 章の再現・回帰試験スクリプト（WildFly を使った疑似 EAP、S1／S2／S2r ほか）。JBOSS_LOG_PIN=on／off で修正後と旧挙動を比べられる。本番イメージには含めない。【2026-09-28 追記】検証用 WAR に、GC を起こす・GC ログを今すぐ回す gc.jsp を追加 |
+| **test/local/（2026-09-27 追加・検証専用）** | Docker を使わない試験。【2026-09-28 追記】entrypoint_test.sh に gc.log・access-log の試験（[16]〜[17h]）、rotation_local.sh に GC_LOG=true（EAP の既定）・T_ACCESS_LOG・T_JAVA_OPTS_GC・T_EP と G1 シナリオ、gc.log・access_log の記録を追加（10-2 (5)） |
 | **docs/DESIGN.md、REJECTED_ALTERNATIVES.md、TROUBLESHOOTING.md** | current の位置づけ、6 章 1 の評価の訂正、案 C（jboss.server.log.dir）を A'／A と組み合わせて採用、切り分け手順を追記 |
 
 ### 環境変数
@@ -778,6 +783,7 @@ aws elbv2 modify-target-group-attributes --target-group-arn <tg-arn> \
 3-B. pin: LOG_OWN=$(cd mid/<LOG_ID> && pwd -P)            … current を経由しない実体パス
    export JBOSS_LOG_DIR=$LOG_OWN
    logging.properties の fileName を $LOG_OWN に揃える
+   JAVA_OPTS 等の -Xlog／-Xloggc と standalone.xml の access-log が共有の置き場を指していれば揃える  … 2026-09-28 追記 (10-2)
    PIN_OPT=-Djboss.server.log.dir=$LOG_OWN                 … 共有の置き場を指す明示指定は上書き
 4. 書き込み検証 ($LOG_OWN, tmp, data) → 5. pdf
 6. 起動 (本番と同じ分岐。2026-09-27 追記)
@@ -906,6 +912,173 @@ test/local/rotation_local.sh の S1（A が 0 時をまたいで稼働 → 0 時
 - 本リポジトリの対応: 綴りは本番のままにした。勝手に直すと、今まで使われていなかった独自トラストストアが急に使われ始め、cacerts にしか無い CA の接続先へ TLS で接続できなくなる恐れがあるため。EXTRASLB_TRUSTSTORE_TYPE が空のときは WARN を出し、base の Dockerfile に既定値 JKS を置いた（JDK 9 以降の JKS 型は、keystore.type.compat=true の既定により PKCS12 形式の cacerts も読める）。
 - **本番で確認してほしいこと:** (a) 実際の起動行が trustStore（大文字 S）か truststore（小文字）か。(b) 小文字なら、独自トラストストアが必要な接続先へ本当に接続できているか（cacerts の CA だけで足りているのか）。(c) EXTRASLB_TRUSTSTORE_PASSWORD が changeit 以外なら、起動ログの ERROR（SSL コンテキスト）や、外部への HTTPS 接続のエラーが出ていないか。直す場合は -Djavax.net.ssl.trustStore に変え、独自トラストストアに必要な CA（cacerts から引き継ぐ分を含む）がそろっていることを確かめてから切り替える。
 
+### 10-2. gc.log と access_log.log にも同じ対策が要るか（2026-09-28 追記）
+
+> **やさしく言うと:** ノートを片付ける係は、server.log のほかにも 2 人いました。GC ログ係（gc.log）とアクセスログ係（access_log.log）です。2 人とも片付けのときは案内板（current）を見て道順でノートを探すので、server.log と同じ事故が起きます。いつもの書き方なら、server.log のために教えた「本当の住所（pin）」が 2 人にもそのまま効きます。ただし「この道順で行け」と直接書いたメモ（JAVA_OPTS の -Xlog や standalone.xml の directory）を持たせていると、住所を教えても効きません。そこで、そのメモの道順も本当の住所へ書き換えるようにしました。
+
+調査報告書は `JBossEAP_gclog_accesslog_rotation_検討.md`／`.xlsx`（このリポジトリを管理しているフォルダの直下）。ここでは要点と実装を書く。
+
+**(1) 結論**
+
+| 対象 | だれが・いつ・どうやって片付けるか | 本番の現状（pin なし。JAVA_OPTS に -Djboss.server.log.dir=${JBOSS_HOME}/standalone/log） | 2026-09-27 までの実装（pin あり） | 追加実装 |
+|---|---|---|---|---|
+| **gc.log** | JVM（HotSpot）が、自分の書いた量が filesize（EAP の既定 3MB）に達するたびに「閉じる → パス名で gc.log.N を削除 → パス名で gc.log を gc.log.N へ rename → パス名で開き直す」。0 時とは関係なく起きる | **GC ログの明示が無ければ起きない（偶然）**。standalone.sh が JAVA_OPTS の -Djboss.server.log.dir を readlink -m で解決し、起動した瞬間の current の先（＝自分の mid/\<ID\>）を -Xlog の file= に入れるため（実機で確認）。この JAVA_OPTS の指定を消して pin も無いと起きる。**【2026-09-29 確認】本番の JAVA_OPTS には -Xlog／-Xloggc の明示があるので、この偶然は働かない**（standalone.sh は自分の指定を作らない）。出力先が standalone/log の下なら**起きる**（下の gc.log の表の最終行。実機の「pin あり＋明示」〔2026-09-27 版〕と同じ条件で再現済み） | 起きない（JBOSS_LOG_DIR と pin から、実体パスの file= ができる。実機で確認） | **本番には必要**（2026-09-29 確認: JAVA_OPTS に明示あり）。JAVA_OPTS（や JAVA_TOOL_OPTIONS／JDK_JAVA_OPTIONS）で -Xlog／-Xloggc の出力先を共有の置き場に明示していると、pin があっても起きる（実機で再現。他タスクの gc.log を削除する）。→ そのパス部分だけを実体パスへ書き換える |
+| **access_log.log** | Undertow が、日付が変わった（JVM のタイムゾーン）後の最初のリクエストで「閉じる → パス名で access_log.log を access_log.\<日付\>.log へ rename（同名があれば -1、-2 …）→ パス名で開き直す」。ファイルは最初のリクエストのときに初めて開く | **起きる（server.log と同じ症状）**。directory の既定 ${jboss.server.log.dir} が /opt/jboss-eap/standalone/log（リンクのまま）になるため。さらに「最初のリクエストで開く」ので、起動後にまだリクエストを受けていないタスクは、別タスクが起動した後だと日付に関係なく他タスクの access_log.log に書き始める（どちらも実機で再現） | 起きない（directory が既定・${jboss.server.log.dir}…・relative-to="jboss.server.log.dir" なら。実機で確認） | **本番では働かない（備え）**。本番の access-log には directory の指定が無い（2026-09-29 確認）ので、pin だけで直る。directory を絶対パス（/opt/jboss-eap/standalone/log）や ${jboss.server.base.dir}/log、relative-to="jboss.server.base.dir" などで書いていると、pin があっても起きる（実機で再現）。→ directory を ${jboss.server.log.dir}\<その下\> へ書き換える |
+
+**まとめ:** 既定の書き方なら、2026-09-27 までの実装（pin）で gc.log も access_log.log も自分のディレクトリに出る。本番の現状（pin なし）では、access_log.log に server.log と同じ事故が起きている。gc.log は、JAVA_OPTS に GC ログの明示が無ければ JAVA_OPTS の -Djboss.server.log.dir のおかげで偶然起きないが、**本番には明示がある（2026-09-29 確認）ので、その出力先が standalone/log の下なら起きる**。pin を素通りする「明示の書き方」は、エントリポイントがそれも実体パスへ揃える（本番の gc.log はこれで直る。本番の access-log は directory の指定が無いので pin だけで直る）。
+
+**(2) gc.log の仕組み**
+
+- **出すかどうか**: JBoss EAP の bin/standalone.conf は「GC_LOG が未設定なら true」にする（EAP 7.4.25 の配布物〔Red Hat の Maven リポジトリの wildfly-ee-galleon-pack 7.4.25.GA-redhat-00001〕と、EAP 8.0／8.1 のコア〔wildfly-core-galleon-pack 21.0.20／27.1.15.Final-redhat-00001〕で確認）。Red Hat の文書も「standalone サーバでは GC ログが既定で有効。GC_LOG=false で無効。3MB ずつ最大 5 ファイルで回す」と説明している。アップストリームの WildFly はこの行がコメントで、既定では出さない。
+
+```sh
+# JBoss EAP 7.4 の bin/standalone.conf の末尾
+# enable garbage collection logging if not set in environment differently
+if [ "x$GC_LOG" = "x" ]; then
+   GC_LOG="true"
+else
+   echo "GC_LOG set in environment to $GC_LOG"
+fi
+```
+
+- **出し方**: standalone.sh（EAP 7.4.25 のものは WildFly Core 15.0.46 と同一）は、JAVA_OPTS に GC ログの指定が無いときだけ、前回の gc.log\* を backupgc.log\* へ退避してから次の指定を足す。JAVA_OPTS に -Xlog:gc か -Xloggc があれば、**自分の指定は足さずに JAVA_OPTS の指定をそのまま使う**。
+
+```sh
+NO_GC_LOG_ROTATE=`echo $JAVA_OPTS | $GREP "\-Xlog\:\?gc"`       # -Xlog:gc / -Xloggc があれば足さない
+if [ "x$NO_GC_LOG_ROTATE" = "x" ]; then
+    mv -f "$JBOSS_LOG_DIR/gc.log" "$JBOSS_LOG_DIR/backupgc.log"    # gc.log.0〜4 も同様に退避
+    # JDK 9 以降
+    TMP_PARAM="-Xlog:gc*:file=\"$JBOSS_LOG_DIR/gc.log\":time,uptimemillis:filecount=5,filesize=3M"
+    # JDK 8: -verbose:gc -Xloggc:"$JBOSS_LOG_DIR/gc.log" … -XX:+UseGCLogFileRotation -XX:NumberOfGCLogFiles=5 -XX:GCLogFileSize=3M
+```
+
+- **JBOSS_LOG_DIR の決まり方**（4-4 と同じ）: -Djboss.server.log.dir が JAVA_OPTS か起動引数にあれば、最後のものを readlink -m で解決した値。無ければ環境変数 JBOSS_LOG_DIR。それも無ければ $JBOSS_BASE_DIR/log（リンクのまま＝current 経由）。
+
+| 構成 | -Xlog の file= | ローテーションの行き先 |
+|---|---|---|
+| pin あり（2026-09-27 からの実装） | mid/\<自分の ID\>/gc.log（実体パス） | 自分のディレクトリ |
+| 本番の現状（pin なし、JAVA_OPTS に -Djboss.server.log.dir=…/standalone/log） | mid/\<起動した瞬間の current の先\>/gc.log（readlink -m で解決済み） | 自分のディレクトリ（起動のその瞬間に別タスクが current を張り替えた場合だけ他タスク） |
+| pin なし、JAVA_OPTS の指定も無し | /opt/jboss-eap/standalone/log/gc.log（リンクのまま） | その瞬間の current の先（最後に起動したタスク） |
+| JAVA_OPTS に -Xlog:gc*:file=/opt/jboss-eap/standalone/log/gc.log などを明示（pin の有無に関係なく） | 明示したまま（standalone.sh は自分の指定を足さない） | その瞬間の current の先 |
+
+> **【2026-09-29 確認】** 本番の JAVA_OPTS には -Xlog／-Xloggc の明示があるので、本番の現状は表の**最終行**にあたる（2 行目の「偶然」は働かない）。本番の JVM（ubi8/openjdk-11）では、-Xloggc も -Xlog と同じ統合ロギングに置き換えられ、filecount／filesize を書かなければ 5 ファイル × 20MB で回す（JDK 11 の arguments.cpp〔-Xloggc の処理〕と logFileOutput.hpp〔DefaultFileCount＝5、DefaultFileSize＝20M〕で確認）。JVM の起動時にも、同じ名前のファイルがあればパス名で gc.log.N へ退避する。
+
+- **JVM のローテーションの手順**（HotSpot の LogFileOutput。JDK 11u と 21u で同じ）:
+
+```cpp
+void LogFileOutput::rotate() {
+  fclose(_stream);                                // ① 自分のファイルを閉じる
+  archive();                                      // ② 下の 2 つ
+  _stream = os::fopen(_file_name, FileOpenMode);  // ③ 同じ「パス名」で開き直す（追記モード）
+  _current_size = 0; increment_file_count();      //    次は gc.log.(N+1)。5 番目の次は 0 に戻る
+}
+void LogFileOutput::archive() {                   // _archive_name = "<file>.<N>"
+  remove(_archive_name);                          // ②-1 同じ番号の古いファイルを「パス名で」削除
+  rename(_file_name, _archive_name);              // ②-2 gc.log を gc.log.N へ「パス名で」改名
+}
+```
+
+- きっかけは、その JVM が書いた量（JVM ごとの数え方。ファイルの実際の大きさではない）が filesize に達したとき。JVM の起動時にも、既存の gc.log があれば gc.log.N へ退避する（JVM だけの再起動＝exit 10 でも起きる）。
+- パスが current を辿ると: A が回すと、B の現役 gc.log が gc.log.N に改名され（B は気付かず書き続ける）、A は B のディレクトリに新しい gc.log を作って書く。続いて B が回すと、B は自分が書いていたファイル（いまの名前は gc.log.N）を ②-1 で**パス名で削除してしまう**。B の GC ログはどのファイルにも残らない（実機で確認）。
+- 0 時とは関係なく、各 JVM が 3MB 書くたびに起きる。並走するタスクが 2 つ以上あれば、日中でも起きる。
+
+**(3) access_log.log の仕組み**
+
+- **設定**（EAP 7.4.25 の undertow サブシステム〔wildfly-undertow 7.4.25.GA-redhat-00001〕。WildFly の main も同じ）: /subsystem=undertow/server=\*/host=\*/setting=access-log の既定値は directory=${jboss.server.log.dir}、relative-to=なし、prefix=access_log.、suffix=log、rotate=true、pattern=common、use-server-log=false。ファイル名は access_log.log、改名後は access_log.2026-09-27.log。
+- **出力先の解決**: AccessLogService は PathManager.resolveRelativePathEntry(directory, relative-to) の結果を Paths.get() するだけで、シンボリックリンクは解決しない。relative-to を付けると「その path の値 + / + directory」になる。jboss.server.log.dir の値は ServerEnvironment が new File(値) のまま使う（4-4・10-1）。→ pin なしでは /opt/jboss-eap/standalone/log/access_log.log（current 経由）。
+- **Undertow の DefaultAccessLogReceiver**（EAP 7.4.25 の undertow-core 2.2.40.SP3。main では書き込みの流れが整理されたが、ローテーションの手順は同じ）:
+
+```java
+private void writeMessage(final List<String> messages) {
+    if (System.currentTimeMillis() > changeOverPoint) {   // 日付が変わった後の最初の書き込み
+        doRotate();
+    }
+    if (writer == null) {                                  // 最初の 1 件目、または改名の直後
+        writer = Files.newBufferedWriter(defaultLogFile, UTF_8, APPEND, CREATE);   // ③ パス名で開く
+    }
+    ...                                                    // 書いて flush
+}
+private void doRotate() {
+    writer.close(); writer = null;                         // ① 自分のファイルを閉じる
+    if (!Files.exists(defaultLogFile)) return;             //    パス名で存在確認
+    Path newFile = outputDirectory.resolve(logBaseName + currentDateString + "." + logNameSuffix);
+    int count = 0;
+    while (Files.exists(newFile)) {                        //    同名があれば -1、-2 …（上書きはしない）
+        ++count;
+        newFile = outputDirectory.resolve(logBaseName + currentDateString + "-" + count + "." + logNameSuffix);
+    }
+    Files.move(defaultLogFile, newFile);                   // ② パス名で改名
+    ... calculateChangeOverPoint();                        //    次の 0 時（JVM の既定のタイムゾーン）
+}
+```
+
+- server.log との違い: ① 上書き（REPLACE_EXISTING）をしないので、丸ごと消える事故は起きない。代わりに access_log.\<日付\>-1.log のような番号付きの名前ができる。② ファイルを開くのは起動時ではなく最初のリクエストのとき。③ ALB のヘルスチェックも 1 件として書かれるので、ローテーションはほぼ 0 時ちょうどに全タスクで起きる（server.log の「0 時以降の最初のログ」より起きやすい）。
+- パスが current を辿ると（S2r：B が先に書く）: B は自分のファイルを正しく access_log.\<前日\>.log に改名して新しい access_log.log を開く。続く A のローテーションが、その B の新しい現役ファイルを access_log.\<前日\>-1.log に改名し、B は当日分をそこへ書き続ける（server.log と同じ症状）。A の当日分は B のディレクトリの access_log.log へ。A 自身の access_log.log は改名されずに残る（実機で確認）。
+- 「最初のリクエストで開く」ため、0 時と関係なく、起動後にまだリクエストを受けていないタスクが、別タスクの起動後に初めてリクエストを受けると、そのタスクの access_log.log を開いて書き始める。2 つの JVM が同じファイルに追記することになる（NFS では追記が原子的でない。4-6）。
+
+**(4) 追加実装（entrypoint.sh の 3-B）**
+
+pin を適用するとき（JBOSS_LOG_PIN=on で、mid/ の外を指す -Djboss.server.log.dir の明示が無いとき）に次を行う。対象は、共有の置き場（イメージに焼いた ${JBOSS_HOME}/standalone/log とその下、mid/ とその下。実在するものは物理パスでも判定）を指す指定だけ。
+
+| 対象 | 見る場所 | 書き換えるもの | 書き換えないもの |
+|---|---|---|---|
+| gc.log | JAVA_OPTS・JAVA_TOOL_OPTIONS・JDK_JAVA_OPTIONS の各字句。-Xlog:\<対象\>:[file=]\<パス\>[:…] と -Xloggc:\<パス\>（引用符付きも） | パス部分だけを ${LOG_OWN}\<共有の置き場より下の残り\>/\<ファイル名\> へ。字句の他の部分と、値全体の他の部分は 1 文字も変えない。下のディレクトリは作る。note 行を出す | 全タスクで共有する EFS 上の場所（EFS_LOG_DIR の直下など）→ WARN のみ。相対パス・stdout／stderr・mid/ の外 → 何もしない。$JBOSS_HOME・${JBOSS_HOME} のような変数を文字のまま含むパス（standalone.sh が起動時に eval で展開するので、JVM には本物のパスが届く）も、エントリポイントでは判定できないので何もしない（note も WARN も出ない。本番の値がこの形なら、エントリポイントかタスク定義で展開済みのパスに直す） |
+| gc.log | イメージの standalone.conf（RUN_CONF があればそれ） | ―（読み取り専用のルート FS 上にあり、書き換えられない） | コメント以外の行で -Xlog を含み、standalone/log か /mid/ を含むもの → WARN（$JBOSS_LOG_DIR/gc.log を使う書き方に直す） |
+| access_log.log | ${CONF_DIR}/${JBOSS_CONFIG_FILE}（CMD=eap なら SERVER_CONFIG のファイル）の \<access-log …\> 要素（1 行に収まっているもの） | directory が絶対パス・${jboss.server.base.dir}…・${jboss.home.dir}…、または relative-to="jboss.server.base.dir"／"jboss.home.dir" で、共有の置き場を指すもの → directory="${jboss.server.log.dir}\<その下\>" にし、relative-to を外す。note 行を出す | 式（${env.X} など）・全タスク共有の EFS・属性が複数行・relative-to だけで directory が無い → WARN のみ。use-server-log="true"、relative-to="jboss.server.log.dir"／"jboss.server.data.dir" など、既定・${jboss.server.log.dir}… → 何もしない |
+
+- JAVA_OPTS を書き換えるのは、10-1 (4) で「採用しない」とした案 3 と同じ種類の方法だが、GC ログの指定は JVM のオプションなので、-Djboss.server.log.dir のように起動引数で上書きすることができない。そのため、字句の中のパス部分だけを置き換える最小限の書き換えにした。
+- standalone.xml は、毎起動 seed から復元される作業用のコピー（CONFIG_SEED_MODE=overwrite）を書き換える。seed（イメージ）は変えない。CONFIG_SEED_MODE=missing／skip で持ち越した standalone.xml でも、2 回目以降は書き換え済みなので何もしない。
+- 起動ログの例（本番と同じ CMD=eap・JAVA_OPTS に -Djboss.server.log.dir と -Xlog の明示・access-log の directory が絶対パスの場合。実機）:
+
+```
+[efs-entrypoint] log pin: JBoss は /mnt/logs/…/mid/<ID> へ直接書き込みます (current は書き込み経路に使いません)
+[efs-entrypoint] note: 共有の置き場 (current 経由) を指す -Djboss.server.log.dir の指定 (JAVA_OPTS: /opt/jboss-eap/standalone/log) は pin で上書きします (docs/LOG_ROTATION.md 10-1)
+[efs-entrypoint] note: 共有の置き場を指す GC ログの指定 (JAVA_OPTS: /opt/jboss-eap/standalone/log/gc.log) を /mnt/logs/…/mid/<ID> へ書き換えました (docs/LOG_ROTATION.md 10-2)
+[efs-entrypoint] note: access-log (standalone.xml 466 行目) の出力先 directory=/opt/jboss-eap/standalone/log は共有の置き場を指すため、directory=${jboss.server.log.dir} (= /mnt/logs/…/mid/<ID>) に書き換えました (docs/LOG_ROTATION.md 10-2)
+```
+
+**(5) 実機確認（WildFly 26.1.3 ≒ EAP 7.4、Temurin JRE 11.0.32.1、2026-09-28）**
+
+test/local/rotation_local.sh に、EAP と同じ GC_LOG=true、access-log の有効化（T_ACCESS_LOG）、GC ログの明示（T_JAVA_OPTS_GC）、GC ログを今すぐ回す検証用 JSP（jcmd の VM.log rotate と同じ処理）、G1 シナリオを足して確かめた。「2026-09-27 版」は修正前（pin はあるが gc.log・access_log.log の書き換えが無い）のエントリポイント。
+
+| シナリオ | 構成 | エントリポイント | 結果 | 確認できたこと |
+|---|---|---|---|---|
+| G1（0 時と無関係。A 起動 → B 起動 → A が初めてリクエストを受ける → A・B の GC ログを順に回す） | pin なし・JAVA_OPTS の指定なし | ― | 再現 | A は最初のリクエストで B の access_log.log を開き、2 つの JVM が同じファイルに書いた。A が GC ログを回すと B の現役 gc.log が gc.log.0 に改名され、続いて B が回すと B は自分の GC ログ（266 行）を削除した（どこにも残らない）。A の gc.log は A のディレクトリで改名されないまま |
+| G1 | 本番の現状（CMD=eap、JAVA_OPTS に -Djboss.server.log.dir、pin なし） | 2026-09-27 版 | gc.log は問題なし・access_log.log は再現 | -Xlog の file= は standalone.sh が解決した mid/\<自分\>/gc.log で、GC ログは各自のディレクトリで回った。access_log.log は A が B のファイルを開いた |
+| G1 | pin あり（既定の書き方） | 2026-09-27 版 | 問題なし | gc.log・access_log.log とも各自のディレクトリ。gc.log.0（回す前）と gc.log（回した後）がそろう |
+| G1 | pin あり＋JAVA_OPTS に -Xlog:gc*:file=\<JBOSS_HOME\>/standalone/log/gc.log＋access-log の directory が絶対パス（本番と同じ CMD=eap・JAVA_OPTS） | 2026-09-27 版 | 再現 | pin があっても -Xlog は明示のまま（standalone.sh は自分の指定を足さない）で、B の gc.log が改名され、続いて B 自身の GC ログ（276 行）が削除された。access_log.log も A が B のファイルを開いた |
+| G1 | 同上 | 今回の版 | 解消 | note 行が 2 つ（GC ログ・access-log）。-Xlog の file= が mid/\<自分\>/gc.log に、standalone.xml の directory が ${jboss.server.log.dir} になり、どちらも各自のディレクトリ |
+| G1 | pin あり＋-Xlog の明示＋access-log が relative-to="jboss.server.base.dir" directory="log" | 今回の版 | 解消 | relative-to を外して directory=${jboss.server.log.dir} に書き換え。各自のディレクトリ |
+| S2r（A・B が 0 時をまたぐ。B が先にリクエスト） | pin なし・JAVA_OPTS の指定なし | ― | 再現 | B の当日分が access_log.2026-09-27-1.log へ（fd で確認）。A の当日分は B のディレクトリの access_log.log。A の access_log.log は改名されないまま。server.log も同時に再現（B の前日分が消失） |
+| S2r | 本番の現状（CMD=eap、JAVA_OPTS に -Djboss.server.log.dir、pin なし） | 2026-09-27 版 | 再現 | 上と同じ結果（本番の現状で access_log.log にも server.log と同じ症状が起きる） |
+| S2r | pin あり＋-Xlog の明示＋access-log の directory が絶対パス（本番と同じ CMD=eap・JAVA_OPTS） | 2026-09-27 版 | access_log.log は再現 | server.log は pin で解消しているが、access_log.log は上と同じ（B の当日分が access_log.2026-09-27-1.log へ、A の当日分は B のディレクトリへ） |
+| S2r | 同上 | 今回の版 | 解消 | A・B とも自分のディレクトリに access_log.2026-09-27.log（前日分）と access_log.log（当日分）。fd も各自の access_log.log のまま |
+
+WildFly 41.0.1（≒ EAP 8.x）での実機確認は、作業 PC の C: ドライブの空きが 2.7GB まで減った（Windows の pagefile.sys が 9.9GB に拡張された）ため見送った。ソースでは、JDK 21u の LogFileOutput のローテーション手順は JDK 11u と同じ、EAP 8.0／8.1 の standalone.conf（GC_LOG の既定 true）は EAP 7.4 と同じ、standalone.sh の GC ログの部分も実質同じ（正規表現の書き方と -d32／-d64 の扱いだけが違い、「JAVA_OPTS に GC ログの指定があれば足さない」「-Xlog:gc*:file=$JBOSS_LOG_DIR/gc.log … filecount=5,filesize=3M」は同じ）、Undertow の main と WildFly の main の access-log の既定値・改名の手順も同じであることを確認した。
+
+**(6) 確認方法**
+
+```sh
+# ECS Exec: JVM が握っている gc.log・access_log.log と、GC ログの起動引数
+for p in /proc/[0-9]*; do
+  case "$(readlink $p/exe 2>/dev/null)" in
+    */java) ls -l $p/fd | grep -E 'gc\.log|access_log'           # mid/<自分の LOG_ID>/ の下であること
+            tr '\0' '\n' < $p/cmdline | grep -E '^-Xlog|^-Xloggc' ;;  # file= が実体パスであること
+  esac
+done
+# access-log の設定 (directory が ${jboss.server.log.dir} か、未設定=既定であること)
+/opt/jboss-eap/bin/jboss-cli.sh -c --command='/subsystem=undertow/server=default-server/host=default-host/setting=access-log:read-resource'
+```
+
+- すでに名前と中身がずれた access_log の洗い出し: `access_log.YYYY-MM-DD[-N].log` の名前の日付と、1 行目の `[27/Sep/2026:…]` の日付を比べる（11 章の server.log の洗い出しと同じ考え方）。
+
+**(7) 運用上の注意**
+
+- JBOSS_LOG_PIN=off のまま、本番の JAVA_OPTS から -Djboss.server.log.dir を消さない。gc.log が current 経由になり、GC ログの改名・削除が始まる（pin=off は切り分け専用）。pin=on（既定）なら、消しても gc.log は実体パスのまま。
+- ログ収集ツールの対象は mid/\*/gc.log\*・mid/\*/access_log\* にする（current は他タスクの起動で切り替わる）。
+- 同じ理由で、logging サブシステムに自分で足したファイルハンドラも、path を /opt/jboss-eap/standalone/log/… の絶対パスや relative-to="jboss.server.base.dir" + path="log/…" で書いていると current 経由になる。relative-to="jboss.server.log.dir" で書けば pin に乗る（エントリポイントは確認しない。standalone.xml を grep して確かめる）。
+- アプリのログ（/webapp/…/logs → EFS の \<Service_Name\> 直下）は、mid/ のような「タスクごとのディレクトリ」が無く、全タスクが同じ場所に書く。アプリがタスク固有でないファイル名で日付ローテーションしていると、同じ種類の事故が起きる（JBoss の設定ではないので本書の対象外。アプリのログ設定を確認すること）。
+
 ---
 
 ## 11. 確認手順・移行手順・運用
@@ -923,7 +1096,7 @@ test/local/rotation_local.sh の S1（A が 0 時をまたいで稼働 → 0 時
 aws ecs execute-command --cluster <c> --task <t> --container <name> --interactive --command /bin/sh
 for p in /proc/[0-9]*; do
   case "$(readlink $p/exe 2>/dev/null)" in
-    */java) ls -l $p/fd | grep -E '\.log'                                   # fd -> .../mid/<自分の LOG_ID>/server.log
+    */java) ls -l $p/fd | grep -E '\.log'                                   # fd -> .../mid/<自分の LOG_ID>/server.log (gc.log・access_log.log も同じディレクトリ)
             tr '\0' '\n' < $p/cmdline | grep -E 'log.dir|boot.log.file' ;;  # どちらも実体パスであること
   esac
 done
@@ -1008,3 +1181,11 @@ done
 | **AWS** | How Amazon EFS works（NFSv4.0／4.1） | https://docs.aws.amazon.com/efs/latest/ug/how-it-works.html |
 | **Linux** | open(2) man page（O_APPEND と NFS の注意） | https://man7.org/linux/man-pages/man2/open.2.html |
 | **考え方** | The Twelve-Factor App — XI. Logs | https://12factor.net/logs |
+| **ソース（10-2）** | OpenJDK HotSpot LogFileOutput（-Xlog のファイル出力とローテーション。jdk11u） | https://github.com/openjdk/jdk11u/blob/master/src/hotspot/share/logging/logFileOutput.cpp |
+| **ソース（10-2）** | OpenJDK HotSpot LogFileOutput（jdk21u） | https://github.com/openjdk/jdk21u/blob/master/src/hotspot/share/logging/logFileOutput.cpp |
+| **ソース（10-2）** | Undertow DefaultAccessLogReceiver（アクセスログのローテーション） | https://github.com/undertow-io/undertow/blob/main/core/src/main/java/io/undertow/server/handlers/accesslog/DefaultAccessLogReceiver.java |
+| **ソース（10-2）** | WildFly undertow サブシステム AccessLogDefinition（directory の既定 ${jboss.server.log.dir} など） | https://github.com/wildfly/wildfly/blob/main/undertow/src/main/java/org/wildfly/extension/undertow/AccessLogDefinition.java |
+| **配布物（10-2）** | JBoss EAP 7.4 の feature pack（bin/standalone.conf の GC_LOG 既定 true。wildfly-ee-galleon-pack 7.4.25.GA-redhat-00001） | https://maven.repository.redhat.com/ga/org/jboss/eap/wildfly-ee-galleon-pack/ |
+| **配布物（10-2）** | JBoss EAP のソース（undertow-core 2.2.40.SP3・wildfly-undertow 7.4.25.GA・wildfly-server 15.0.46 の -sources.jar） | https://maven.repository.redhat.com/ga/ |
+| **Red Hat（10-2）** | JBoss EAP 7.4 Configuration Guide — Garbage Collection Logging（既定で有効・GC_LOG=false で無効・3MB×5） | https://docs.redhat.com/en/documentation/red_hat_jboss_enterprise_application_platform/7.4/html/configuration_guide/logging_with_jboss_eap |
+| **Red Hat（10-2）** | JBoss EAP 7.4 Performance Tuning Guide — Enabling garbage collection logging | https://docs.redhat.com/en/documentation/red_hat_jboss_enterprise_application_platform/7.4/html/performance_tuning_guide/diagnosing_performance_issues |

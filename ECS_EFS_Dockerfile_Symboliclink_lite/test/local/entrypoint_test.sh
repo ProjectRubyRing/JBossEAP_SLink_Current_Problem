@@ -61,8 +61,26 @@ for a in "$@"; do echo "ARG[$a]"; done
 echo "JBOSS_LOG_DIR=${JBOSS_LOG_DIR:-<unset>}"
 echo "LOG_ID_SOURCE=${LOG_ID_SOURCE:-<unset>}"
 echo "JAVA_OPTS=${JAVA_OPTS:-<unset>}"
+echo "JAVA_TOOL_OPTIONS=${JAVA_TOOL_OPTIONS:-<unset>}"
+echo "JDK_JAVA_OPTIONS=${JDK_JAVA_OPTIONS:-<unset>}"
 SS
   chmod +x "$JH/bin/standalone.sh"
+}
+
+# seed の standalone.xml を、undertow の default-host の中に要素 (1 つ 1 行) を並べた形で作る。
+# 1 つ目の要素が 6 行目になる。ファイル名は XMLNAME (既定 standalone.xml)
+mkxml() {
+  { echo '<server xmlns="urn:jboss:domain:16.0">'
+    echo '    <subsystem xmlns="urn:jboss:domain:undertow:12.0">'
+    echo '        <server name="default-server">'
+    echo '            <host name="default-host" alias="localhost">'
+    echo '                <location name="/" handler="welcome-content"/>'
+    for e in "$@"; do echo "                $e"; done
+    echo '            </host>'
+    echo '        </server>'
+    echo '    </subsystem>'
+    echo '</server>'
+  } > "$SD/configuration-seed/${XMLNAME:-standalone.xml}"
 }
 
 # エントリポイントの実行 (出力は $OUT、終了コードは $RC)
@@ -420,6 +438,171 @@ for SH in "${SHELLS[@]}"; do
   mkroot
   run_ep SERVER_CONFIG=standalone.xml -- eap --debug -Dfoo.password=zzz
   check "rc=0 / WARN / 引数に含まれない" '[ $RC -eq 0 ] && grep -qF "WARN: CMD=eap の後ろの引数は使いません (本番と同じ): --debug -Dfoo.password=****" <<<"$OUT" && ! grep -q "^ARG\[--debug\]" <<<"$OUT" && ! grep -q "zzz" <<<"$OUT"'
+  rm -rf "$R"
+
+  # ---- gc.log (JVM の GC ログ): JAVA_OPTS 等の -Xlog / -Xloggc ------------------
+  GCX="time,uptimemillis:filecount=5,filesize=3M"
+
+  echo "  [16] JAVA_OPTS の GC ログの指定が共有の置き場 (<JBOSS_HOME>/standalone/log) を指す → パス部分だけ実体パスへ"
+  mkroot
+  run_ep "JAVA_OPTS=-Xms64m  -Xlog:gc*:file=$JH/standalone/log/gc.log:$GCX -Dfoo=\"a b\"" -- "$JH/bin/standalone.sh"
+  D=$(own_dir)
+  EXP="JAVA_OPTS=-Xms64m  -Xlog:gc*:file=$D/gc.log:$GCX -Dfoo=\"a b\""
+  check "rc=0 / file= のパスだけ実体パス。他の部分 (二重の空白・引用符) は 1 文字も変えない" '[ $RC -eq 0 ] && grep -qxF "$EXP" <<<"$OUT"'
+  check "note 行に出どころと元のパス" 'grep -qF "note: 共有の置き場を指す GC ログの指定 (JAVA_OPTS: $JH/standalone/log/gc.log) を $D へ書き換えました" <<<"$OUT"'
+  check "pin (-Djboss.server.log.dir) と JBOSS_LOG_DIR はこれまでどおり" '[ "$(grep -m1 "^ARG\[" <<<"$OUT")" = "ARG[-Djboss.server.log.dir=$D]" ] && grep -qx "JBOSS_LOG_DIR=$D" <<<"$OUT"'
+  rm -rf "$R"
+
+  echo "  [16b] 引用符付き・file= なし・mid/current・サブディレクトリ・-Xloggc (JDK 8) も書き換える"
+  mkroot
+  run_ep "JAVA_OPTS=-Xlog:gc*:file=\"$JH/standalone/log/gc.log\":$GCX '-Xloggc:$JH/standalone/log/old-gc.log' -Xlog:safepoint:$MID/current/sp.log -Xlog:gc+heap=debug:file=$JH/standalone/log/gc/heap.log" -- "$JH/bin/standalone.sh"
+  D=$(own_dir)
+  EXP="JAVA_OPTS=-Xlog:gc*:file=\"$D/gc.log\":$GCX '-Xloggc:$D/old-gc.log' -Xlog:safepoint:$D/sp.log -Xlog:gc+heap=debug:file=$D/gc/heap.log"
+  check "rc=0 / 4 つとも実体パス (引用符は元の位置のまま)" '[ $RC -eq 0 ] && grep -qxF "$EXP" <<<"$OUT"'
+  check "サブディレクトリ (gc/) を実体側に作る" '[ -d "$D/gc" ]'
+  rm -rf "$R"
+
+  echo "  [16c] mid/ の外・相対パス・stdout・-Xlog:disable・出力先なし → 書き換えない (note・WARN なし)"
+  mkroot
+  mkdir -p "$R/var/log"
+  V="-Xlog:gc*:file=$R/var/log/gc.log:$GCX -Xlog:gc:file=gc.log -Xlog:gc*:stdout -Xlog:disable -Xlog:gc"
+  run_ep "JAVA_OPTS=$V" -- "$JH/bin/standalone.sh"
+  check "rc=0 / JAVA_OPTS はそのまま" '[ $RC -eq 0 ] && grep -qxF "JAVA_OPTS=$V" <<<"$OUT" && ! grep -q "GC ログ" <<<"$OUT"'
+  rm -rf "$R"
+
+  echo "  [16d] 全タスクで共有する EFS (EFS_LOG_DIR の直下) を指す → 書き換えずに WARN"
+  mkroot
+  run_ep "JAVA_OPTS=-Xlog:gc*:file=$EFS/gc.log:$GCX" -- "$JH/bin/standalone.sh"
+  check "rc=0 / そのまま / WARN" '[ $RC -eq 0 ] && grep -qxF "JAVA_OPTS=-Xlog:gc*:file=$EFS/gc.log:$GCX" <<<"$OUT" && grep -qF "WARN: JAVA_OPTS の GC ログの出力先 $EFS/gc.log は全タスクで共有する EFS 上の場所です" <<<"$OUT"'
+  rm -rf "$R"
+
+  echo "  [16e] JAVA_TOOL_OPTIONS・JDK_JAVA_OPTIONS も同じく / 同じ字句が 2 つあれば 2 つとも"
+  mkroot
+  T="-Xlog:gc:file=$JH/standalone/log/gc.log"
+  run_ep "JAVA_TOOL_OPTIONS=$T -Dx=1 $T" "JDK_JAVA_OPTIONS=-Xloggc:$MID/current/gc8.log" -- "$JH/bin/standalone.sh"
+  D=$(own_dir)
+  check "JAVA_TOOL_OPTIONS の 2 つとも実体パス" 'grep -qxF "JAVA_TOOL_OPTIONS=-Xlog:gc:file=$D/gc.log -Dx=1 -Xlog:gc:file=$D/gc.log" <<<"$OUT"'
+  check "JDK_JAVA_OPTIONS も実体パス / JAVA_OPTS は未設定のまま" 'grep -qxF "JDK_JAVA_OPTIONS=-Xloggc:$D/gc8.log" <<<"$OUT" && grep -qx "JAVA_OPTS=<unset>" <<<"$OUT"'
+  check "note に 3 件" 'grep -qF "(JAVA_TOOL_OPTIONS: $JH/standalone/log/gc.log, JAVA_TOOL_OPTIONS: $JH/standalone/log/gc.log, JDK_JAVA_OPTIONS: $MID/current/gc8.log)" <<<"$OUT"'
+  rm -rf "$R"
+
+  echo "  [16f] JBOSS_LOG_PIN=off・mid/ の外の -Djboss.server.log.dir (pin しない) → GC ログの指定もそのまま"
+  mkroot
+  V="-Xlog:gc*:file=$JH/standalone/log/gc.log:$GCX"
+  run_ep JBOSS_LOG_PIN=off "JAVA_OPTS=$V" -- "$JH/bin/standalone.sh"
+  check "pin=off: そのまま・note なし" '[ $RC -eq 0 ] && grep -qxF "JAVA_OPTS=$V" <<<"$OUT" && ! grep -q "GC ログの指定" <<<"$OUT"'
+  mkdir -p "$R/var/jboss-log"
+  run_ep "JAVA_OPTS=$V -Djboss.server.log.dir=$R/var/jboss-log" -- "$JH/bin/standalone.sh"
+  check "明示指定を尊重 (pin しない): そのまま・note なし" '[ $RC -eq 0 ] && grep -qxF "JAVA_OPTS=$V -Djboss.server.log.dir=$R/var/jboss-log" <<<"$OUT" && ! grep -q "GC ログの指定" <<<"$OUT"'
+  rm -rf "$R"
+
+  echo "  [16g] CMD=eap + 本番と同じ JAVA_OPTS (-Djboss.server.log.dir=<JBOSS_HOME>/standalone/log) + GC ログの明示"
+  mkroot
+  run_ep SERVER_CONFIG=standalone.xml "JAVA_OPTS=-Xms64m -Djboss.server.log.dir=$JH/standalone/log -Xlog:gc*:file=$JH/standalone/log/gc.log:$GCX" -- eap
+  D=$(own_dir)
+  check "rc=0 / pin は起動引数・JAVA_OPTS の -Djboss.server.log.dir は変えず、-Xlog のパスだけ実体パス" '[ $RC -eq 0 ] && [ "$(grep -m1 "^ARG\[" <<<"$OUT")" = "ARG[-Djboss.server.log.dir=$D]" ] && grep -qxF "JAVA_OPTS=-Xms64m -Djboss.server.log.dir=$JH/standalone/log -Xlog:gc*:file=$D/gc.log:$GCX" <<<"$OUT"'
+  check "note は 2 つ (-Djboss.server.log.dir と GC ログ)" 'grep -q "note: 共有の置き場 (current 経由) を指す -Djboss.server.log.dir" <<<"$OUT" && grep -q "note: 共有の置き場を指す GC ログの指定" <<<"$OUT"'
+  rm -rf "$R"
+
+  echo "  [16h] イメージの standalone.conf に共有の置き場を指す GC ログの指定 → WARN (書き換えられない)"
+  mkroot
+  # shellcheck disable=SC2016  # standalone.conf の中身 ($… はそのまま書く)
+  printf '%s\n' '# JAVA_OPTS="$JAVA_OPTS -Xlog:gc*:file=$JBOSS_HOME/standalone/log/commented.log"' \
+                'JAVA_OPTS="$JAVA_OPTS -Xlog:gc*:file=$JBOSS_LOG_DIR/gc.log"' > "$JH/bin/standalone.conf"
+  run_ep -- "$JH/bin/standalone.sh"
+  check "コメント行と \$JBOSS_LOG_DIR の書き方は WARN しない" '[ $RC -eq 0 ] && ! grep -q "standalone.conf に共有の置き場" <<<"$OUT"'
+  # shellcheck disable=SC2016
+  echo 'JAVA_OPTS="$JAVA_OPTS -Xlog:gc*:file=$JBOSS_HOME/standalone/log/gc.log:time"' >> "$JH/bin/standalone.conf"
+  run_ep -- "$JH/bin/standalone.sh"
+  check "共有の置き場を指す行 → WARN (行番号付き)。止めない" '[ $RC -eq 0 ] && grep -qF "WARN: $JH/bin/standalone.conf に共有の置き場 (standalone/log・mid/) を指していそうな GC ログの指定があります: 3:" <<<"$OUT"'
+  rm -rf "$R"
+
+  # ---- access_log.log (Undertow のアクセスログ): standalone.xml の access-log --------
+  X="standalone.xml"
+  echo "  [17] access-log が既定・\${jboss.server.log.dir}・relative-to=jboss.server.log.dir → pin だけで自分のディレクトリ (書き換えない)"
+  mkroot
+  # shellcheck disable=SC2016  # ${jboss.server.log.dir} は JBoss の式 (そのまま書く)
+  mkxml '<access-log/>' '<access-log pattern="combined" directory="${jboss.server.log.dir}"/>' \
+        '<access-log relative-to="jboss.server.log.dir" directory="access"/>' '<access-log directory="${jboss.server.log.dir}/sub" rotate="true"/>'
+  cp "$SD/configuration-seed/$X" "$R/expected.xml"
+  run_ep -- "$JH/bin/standalone.sh"
+  check "rc=0 / standalone.xml は seed と同じ / note も WARN も無し" '[ $RC -eq 0 ] && cmp -s "$SD/configuration/$X" "$R/expected.xml" && ! grep -q "access-log" <<<"$OUT"'
+  rm -rf "$R"
+
+  echo "  [17b] directory が絶対パスで共有の置き場 → directory=\${jboss.server.log.dir}<残り> に書き換え (他の属性はそのまま)"
+  mkroot
+  mkxml "<access-log pattern=\"common\" directory=\"$JH/standalone/log\" prefix=\"access_log.\"/>" "<access-log directory=\"$JH/standalone/log/access/\" rotate=\"true\"/>"
+  run_ep -- "$JH/bin/standalone.sh"
+  D=$(own_dir)
+  check "rc=0 / 6 行目: directory=\${jboss.server.log.dir}、pattern・prefix はそのまま" '[ $RC -eq 0 ] && [ "$(sed -n 6p "$SD/configuration/$X")" = "                <access-log pattern=\"common\" directory=\"\${jboss.server.log.dir}\" prefix=\"access_log.\"/>" ]'
+  check "7 行目: 下のディレクトリは残す (\${jboss.server.log.dir}/access)" '[ "$(sed -n 7p "$SD/configuration/$X")" = "                <access-log directory=\"\${jboss.server.log.dir}/access\" rotate=\"true\"/>" ]'
+  check "note に行番号・元の値・実体パス" 'grep -qF "note: access-log (standalone.xml 6 行目) の出力先 directory=$JH/standalone/log は共有の置き場を指すため、directory=\${jboss.server.log.dir} (= $D) に書き換えました" <<<"$OUT"'
+  check "seed は変えない" 'grep -qF "directory=\"$JH/standalone/log\"" "$SD/configuration-seed/$X"'
+  rm -rf "$R"
+
+  echo "  [17c] relative-to=jboss.server.base.dir・\${jboss.server.base.dir}/log・\${jboss.home.dir}/standalone/log・relative-to=jboss.home.dir → 書き換え (relative-to は外す)"
+  mkroot
+  # shellcheck disable=SC2016
+  mkxml '<access-log pattern="common" relative-to="jboss.server.base.dir" directory="log"/>' \
+        '<access-log directory="${jboss.server.base.dir}/log/a"/>' \
+        '<access-log directory="${jboss.home.dir}/standalone/log"/>' \
+        '<access-log directory="standalone/log/b" relative-to="jboss.home.dir"/>'
+  run_ep -- "$JH/bin/standalone.sh"
+  check "rc=0 / 6 行目: relative-to を外して directory=\${jboss.server.log.dir}" '[ $RC -eq 0 ] && [ "$(sed -n 6p "$SD/configuration/$X")" = "                <access-log pattern=\"common\" directory=\"\${jboss.server.log.dir}\"/>" ]'
+  check "7〜9 行目" '[ "$(sed -n 7p "$SD/configuration/$X")" = "                <access-log directory=\"\${jboss.server.log.dir}/a\"/>" ] && [ "$(sed -n 8p "$SD/configuration/$X")" = "                <access-log directory=\"\${jboss.server.log.dir}\"/>" ] && [ "$(sed -n 9p "$SD/configuration/$X")" = "                <access-log directory=\"\${jboss.server.log.dir}/b\"/>" ]'
+  check "note は 4 件 (relative-to 付きは元の relative-to も出す)" '[ "$(grep -c "note: access-log (standalone.xml" <<<"$OUT")" -eq 4 ] && grep -qF "6 行目) の出力先 relative-to=jboss.server.base.dir directory=log は共有の置き場を指すため" <<<"$OUT"'
+  rm -rf "$R"
+
+  echo "  [17d] mid/current・前回 LOG_ID の直指定、'…' で書いた属性も書き換え"
+  mkroot
+  mkxml "<access-log directory='$MID/current'/>" "<access-log directory=\"$MID/20260101000000-oldrun00/x\"/>"
+  run_ep -- "$JH/bin/standalone.sh"
+  check "rc=0 / 6 行目: \${jboss.server.log.dir} / 7 行目: \${jboss.server.log.dir}/x" '[ $RC -eq 0 ] && [ "$(sed -n 6p "$SD/configuration/$X")" = "                <access-log directory=\"\${jboss.server.log.dir}\"/>" ] && [ "$(sed -n 7p "$SD/configuration/$X")" = "                <access-log directory=\"\${jboss.server.log.dir}/x\"/>" ]'
+  rm -rf "$R"
+
+  echo "  [17e] use-server-log=true・console-access-log・relative-to=jboss.server.data.dir・mid/ の外 → 書き換えない"
+  mkroot
+  mkdir -p "$R/var/access"
+  mkxml "<access-log use-server-log=\"true\" directory=\"$JH/standalone/log\"/>" "<console-access-log/>" \
+        '<access-log relative-to="jboss.server.data.dir" directory="access"/>' "<access-log directory=\"$R/var/access\"/>"
+  cp "$SD/configuration-seed/$X" "$R/expected.xml"
+  run_ep -- "$JH/bin/standalone.sh"
+  check "rc=0 / standalone.xml は seed と同じ / note も WARN も無し" '[ $RC -eq 0 ] && cmp -s "$SD/configuration/$X" "$R/expected.xml" && ! grep -q "access-log" <<<"$OUT"'
+  rm -rf "$R"
+
+  echo "  [17f] 判定できない式・全タスク共有の EFS・属性が複数行・relative-to だけ → WARN のみ (書き換えない)"
+  mkroot
+  # shellcheck disable=SC2016
+  mkxml '<access-log directory="${env.ACCESS_DIR}"/>' "<access-log directory=\"$EFS\"/>" \
+        '<access-log pattern="common"' "    directory=\"$JH/standalone/log\"/>" '<access-log relative-to="jboss.server.base.dir"/>'
+  cp "$SD/configuration-seed/$X" "$R/expected.xml"
+  run_ep -- "$JH/bin/standalone.sh"
+  check "rc=0 / standalone.xml は変えない" '[ $RC -eq 0 ] && cmp -s "$SD/configuration/$X" "$R/expected.xml"'
+  check "式 → WARN (6 行目)" 'grep -qF "6 行目の access-log の出力先 \${env.ACCESS_DIR} は式を含むため確認できません" <<<"$OUT"'
+  check "全タスク共有の EFS → WARN (7 行目)" 'grep -qF "7 行目の access-log の出力先 $EFS は全タスクで共有する EFS 上の場所です" <<<"$OUT"'
+  check "属性が複数行 → WARN (8 行目)" 'grep -qF "8 行目の access-log は属性が複数行にわたるため" <<<"$OUT"'
+  check "relative-to だけ → WARN (10 行目)" 'grep -qF "10 行目の access-log は relative-to=jboss.server.base.dir だけで directory が無いため" <<<"$OUT"'
+  rm -rf "$R"
+
+  echo "  [17g] JBOSS_LOG_PIN=off → 書き換えない / CMD=eap は SERVER_CONFIG のファイルを見る"
+  mkroot
+  mkxml "<access-log directory=\"$JH/standalone/log\"/>"
+  cp "$SD/configuration-seed/$X" "$R/expected.xml"
+  run_ep JBOSS_LOG_PIN=off -- "$JH/bin/standalone.sh"
+  check "pin=off: そのまま・note なし" '[ $RC -eq 0 ] && cmp -s "$SD/configuration/$X" "$R/expected.xml" && ! grep -q "note: access-log" <<<"$OUT"'
+  XMLNAME=standalone-full.xml mkxml "<access-log directory=\"$JH/standalone/log\"/>"
+  run_ep SERVER_CONFIG=standalone-full.xml -- eap
+  check "CMD=eap + SERVER_CONFIG=standalone-full.xml: そのファイルを書き換え、standalone.xml は触らない" '[ $RC -eq 0 ] && grep -qF "directory=\"\${jboss.server.log.dir}\"" "$SD/configuration/standalone-full.xml" && cmp -s "$SD/configuration/$X" "$R/expected.xml" && grep -qF "note: access-log (standalone-full.xml 6 行目)" <<<"$OUT"'
+  rm -rf "$R"
+
+  echo "  [17h] CONFIG_SEED_MODE=skip (configuration を永続化) で 2 回起動 → 2 回目は書き換え済みなので何もしない"
+  mkroot
+  mkxml "<access-log directory=\"$JH/standalone/log\"/>"
+  cp "$SD/configuration-seed/"* "$SD/configuration/"
+  run_ep CONFIG_SEED_MODE=skip -- "$JH/bin/standalone.sh"
+  check "1 回目: 書き換え" '[ $RC -eq 0 ] && grep -qF "directory=\"\${jboss.server.log.dir}\"" "$SD/configuration/$X" && grep -q "note: access-log" <<<"$OUT"'
+  run_ep CONFIG_SEED_MODE=skip -- "$JH/bin/standalone.sh"
+  check "2 回目: note なし・値はそのまま" '[ $RC -eq 0 ] && grep -qF "directory=\"\${jboss.server.log.dir}\"" "$SD/configuration/$X" && ! grep -q "note: access-log" <<<"$OUT"'
   rm -rf "$R"
 done
 
